@@ -4,12 +4,148 @@ import tempfile
 import io
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QTextEdit, QLineEdit, QPushButton, QLabel, QScrollArea, QDialog)
-from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal
-from PyQt5.QtGui import QPainter, QBrush, QColor, QFont
+                             QTextEdit, QLineEdit, QPushButton, QLabel, QScrollArea, QDialog, QSizeGrip)
+from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QRect, QSize
+from PyQt5.QtGui import (QPainter, QBrush, QColor, QFont, QLinearGradient, 
+                        QPen, QPainterPath, QFontMetrics, QGradient)
+from PyQt5.QtWidgets import QGraphicsDropShadowEffect, QGraphicsBlurEffect
 from google import genai
 from PIL import ImageGrab, Image
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, RetryCallState
+
+
+class GlassmorphismTitleBar(QWidget):
+    """Title bar with minimalist floating design"""
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        rect = self.rect()
+        radius = 28  # Matches window radius
+        
+        # Subtle glass tint for the header area
+        glass_brush = QBrush(QColor(255, 255, 255, 10))
+        border_pen = QPen(QColor(255, 255, 255, 15), 1)
+        
+        # Rounded top corners path
+        path = QPainterPath()
+        path.moveTo(0, radius)
+        path.arcTo(0, 0, radius * 2, radius * 2, 180, -90)
+        path.lineTo(rect.width() - radius, 0)
+        path.arcTo(rect.width() - radius * 2, 0, radius * 2, radius * 2, 90, -90)
+        path.lineTo(rect.width(), rect.height())
+        path.lineTo(0, rect.height())
+        path.closeSubpath()
+        
+        painter.setBrush(glass_brush)
+        painter.setPen(border_pen)
+        painter.drawPath(path)
+
+
+class IconButton(QPushButton):
+    """Custom button that paints line-art icons"""
+    def __init__(self, icon_type, parent=None):
+        super().__init__(parent)
+        self.icon_type = icon_type
+        # Smaller size for close icon
+        if icon_type == "close":
+            self.icon_size = 14
+        else:
+            self.icon_size = 24
+    
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Get icon path
+        icon_path = self.createIconPath(self.icon_type, self.icon_size)
+        
+        # Center icon in button - account for boundingRect origin
+        button_rect = self.rect()
+        icon_rect = icon_path.boundingRect()
+        x_offset = (button_rect.width() - icon_rect.width()) / 2 - icon_rect.x()
+        y_offset = (button_rect.height() - icon_rect.height()) / 2 - icon_rect.y()
+        
+        painter.translate(x_offset, y_offset)
+        
+        # Set pen for line-art style
+        if self.icon_type == "send":
+            pen = QPen(QColor(255, 255, 255, 255), 2.5)
+        elif self.icon_type == "close":
+            pen = QPen(QColor(255, 255, 255, 220), 1.5)  # Thinner for close
+        else:
+            pen = QPen(QColor(255, 255, 255, 220), 2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        
+        painter.drawPath(icon_path)
+    
+    def createIconPath(self, icon_type, size):
+        """Create line-art icon path"""
+        path = QPainterPath()
+        half_size = size // 2
+        
+        if icon_type == "send":
+            # Paper plane icon - slightly adjusted for minimalism
+            path.moveTo(size * 0.1, half_size)
+            path.lineTo(half_size * 0.8, size * 0.9)
+            path.lineTo(half_size, size)
+            path.lineTo(half_size * 1.2, size * 0.9)
+            path.lineTo(size * 0.9, half_size)
+            path.lineTo(half_size, half_size * 1.1)
+            path.closeSubpath()
+        elif icon_type == "camera":
+            # Camera icon
+            path.addRoundedRect(4, 6, size - 8, size - 10, 2, 2)
+            path.addEllipse(half_size - 3, half_size - 1, 6, 6)
+        elif icon_type == "close":
+            # Minimalist X - draw from origin for proper centering
+            path.moveTo(0, 0)
+            path.lineTo(size, size)
+            path.moveTo(size, 0)
+            path.lineTo(0, size)
+        elif icon_type == "home":
+            # Simple home icon
+            path.moveTo(half_size, 4)
+            path.lineTo(4, half_size)
+            path.lineTo(6, half_size)
+            path.lineTo(6, size - 4)
+            path.lineTo(size - 6, size - 4)
+            path.lineTo(size - 6, half_size)
+            path.lineTo(size - 4, half_size)
+            path.closeSubpath()
+        elif icon_type == "sparkle":
+            # Simple sparkle/star
+            path.moveTo(half_size, 2)
+            path.lineTo(half_size, size - 2)
+            path.moveTo(2, half_size)
+            path.lineTo(size - 2, half_size)
+        
+        return path
+
+
+class GradientSendButton(IconButton):
+    """Send button with minimalist white icon and dark glow"""
+    def __init__(self, parent=None):
+        super().__init__("send", parent)
+        self.glow_effect = QGraphicsDropShadowEffect()
+        self.glow_effect.setBlurRadius(15)
+        self.glow_effect.setColor(QColor(255, 255, 255, 30))
+        self.glow_effect.setOffset(0, 0)
+        self.setGraphicsEffect(self.glow_effect)
+    
+    def enterEvent(self, event):
+        """Increase glow on hover"""
+        self.glow_effect.setBlurRadius(25)
+        self.glow_effect.setColor(QColor(138, 43, 226, 200))
+        super().enterEvent(event)
+    
+    def leaveEvent(self, event):
+        """Restore base glow on leave"""
+        self.glow_effect.setBlurRadius(15)
+        self.glow_effect.setColor(QColor(255, 255, 255, 30))
+        super().leaveEvent(event)
 
 
 class SettingsDialog(QDialog):
@@ -175,6 +311,13 @@ class CircularWindow(QWidget):
         # API key stored in memory (session only)
         self.api_key = None
         
+        # Dark Mode Glassmorphism colors - Enhanced for minimalist floating look
+        self.charcoal_color = QColor(20, 20, 20, 180)  # Extended alpha for transparency
+        self.onyx_color = QColor(10, 10, 10, 180)      # Extended alpha for transparency
+        self.dark_glass = QColor(0, 0, 0, 100)    # Increased opacity for better contrast with transparent bg
+        self.border_white = QColor(255, 255, 255, 30) # Thinner border
+        self.rim_light = QColor(255, 255, 255, 15)  # Even more subtle rim lighting
+        
         self.initUI()
         
         # Show API key dialog on startup if no key is set
@@ -192,7 +335,7 @@ class CircularWindow(QWidget):
             Qt.Tool                    # Keep above all windows
         )
         
-        # Make window transparent for circular shape
+        # Make window transparent for circular shape and glassmorphism
         self.setAttribute(Qt.WA_TranslucentBackground)
         
         # Set window title
@@ -213,7 +356,7 @@ class CircularWindow(QWidget):
         self.move(x, y)
     
     def setupChatUI(self):
-        """Setup chat UI components (hidden when in bubble state)"""
+        """Setup integrated capsule input UI"""
         # Main layout
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -227,74 +370,145 @@ class CircularWindow(QWidget):
         # Chat message area
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setWidgetResizable(True)
-        self.chat_scroll.setStyleSheet("background-color: white; border: none;")
+        self.chat_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.chat_scroll.setStyleSheet("""
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 6px;
+                margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 3px;
+                min-height: 20px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
         
         self.message_area = QTextEdit()
         self.message_area.setReadOnly(True)
-        self.message_area.setStyleSheet("background-color: white; border: none; padding: 10px;")
+        self.message_area.setStyleSheet("""
+            QTextEdit {
+                background: transparent;
+                border: none;
+                padding: 15px 25px;
+                color: rgba(255, 255, 255, 0.9);
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 14px;
+            }
+        """)
         self.chat_scroll.setWidget(self.message_area)
         self.main_layout.addWidget(self.chat_scroll)
         
-        # Input area
-        self.input_layout = QHBoxLayout()
-        self.input_layout.setContentsMargins(10, 10, 10, 10)
+        # Integrated Capsule Input area
+        self.input_container = QWidget()
+        self.input_container.setFixedHeight(60)
+        
+        container_layout = QHBoxLayout(self.input_container)
+        container_layout.setContentsMargins(10, 0, 10, 10)
+        
+        # The Capsule
+        self.capsule = QWidget()
+        self.capsule.setFixedHeight(50)
+        self.capsule.setStyleSheet("""
+            QWidget#capsule {
+                background: rgba(0, 0, 0, 0.3);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 25px;
+            }
+        """)
+        self.capsule.setObjectName("capsule")
+        
+        capsule_layout = QHBoxLayout(self.capsule)
+        capsule_layout.setContentsMargins(15, 0, 5, 0)
+        capsule_layout.setSpacing(8)
+        capsule_layout.setAlignment(Qt.AlignVCenter)
         
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Type your message...")
+        self.input_field.setPlaceholderText("Ask about your screen or conversation...")
         self.input_field.returnPressed.connect(self.sendMessage)
-        self.input_layout.addWidget(self.input_field)
+        self.input_field.setStyleSheet("""
+            QLineEdit {
+                background: transparent;
+                border: none;
+                color: white;
+                font-size: 13px;
+                padding: 0;
+            }
+        """)
+        capsule_layout.addWidget(self.input_field)
         
-        self.send_button = QPushButton("Send")
-        self.send_button.setFixedWidth(60)
-        self.send_button.clicked.connect(self.sendMessage)
-        self.input_layout.addWidget(self.send_button)
-        
-        # Screenshot button
-        self.screenshot_button = QPushButton("Screenshot")
-        self.screenshot_button.setFixedWidth(90)
+        # Small buttons inside capsule
+        self.screenshot_button = IconButton("camera", self.capsule)
+        self.screenshot_button.setFixedSize(36, 36)
+        self.screenshot_button.setStyleSheet("background: transparent; border-radius: 18px;")
         self.screenshot_button.clicked.connect(self.captureScreenshot)
-        self.input_layout.addWidget(self.screenshot_button)
+        capsule_layout.addWidget(self.screenshot_button)
         
-        self.input_container = QWidget()
-        self.input_container.setLayout(self.input_layout)
-        self.input_container.setStyleSheet("background-color: #f0f0f0;")
+        self.send_button = GradientSendButton(self.capsule)
+        self.send_button.setFixedSize(36, 36)
+        self.send_button.clicked.connect(self.sendMessage)
+        self.send_button.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 18px;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.2);
+            }
+        """)
+        capsule_layout.addWidget(self.send_button)
+        
+        container_layout.addWidget(self.capsule)
         self.main_layout.addWidget(self.input_container)
+        
+        # Add Resising Grip
+        self.size_grip = QSizeGrip(self)
+        self.size_grip.setStyleSheet("background: transparent; width: 20px; height: 20px;")
+        # Position it in the bottom right corner overlapping the layout
         
         # Hide chat UI initially
         self.title_bar.hide()
         self.chat_scroll.hide()
         self.input_container.hide()
+        self.size_grip.hide()
+    
+    def resizeEvent(self, event):
+        """Handle resize event to position size grip"""
+        if hasattr(self, 'size_grip'):
+            rect = self.rect()
+            self.size_grip.move(rect.right() - 20, rect.bottom() - 20)
+        super().resizeEvent(event)
     
     def createTitleBar(self):
-        """Create custom title bar with AI Assistant text and close button"""
-        title_bar = QWidget()
-        title_bar.setFixedHeight(30)
-        title_bar.setStyleSheet("background-color: #2c3e50; color: white;")
+        """Create minimalist header with only Close button"""
+        title_bar = GlassmorphismTitleBar(self)
+        title_bar.setFixedHeight(46)  # Slightly shorter header
         
         layout = QHBoxLayout()
-        layout.setContentsMargins(10, 0, 5, 0)
-        layout.setSpacing(0)
-        
-        # Title label
-        title_label = QLabel("AI Assistant")
-        title_label.setStyleSheet("color: white; font-weight: bold;")
-        layout.addWidget(title_label)
+        # Margins: (left, top, right, bottom)
+        # Adjust these values to move the button
+        layout.setContentsMargins(0, 5, 14, 0) 
+        layout.setSpacing(10)
         
         layout.addStretch()
         
-        # Close button (minimize to bubble)
-        close_button = QPushButton("×")
-        close_button.setFixedSize(25, 25)
+        # Minimalist Close button
+        close_button = IconButton("close", title_bar)
+        close_button.setFixedSize(24, 24)
         close_button.setStyleSheet("""
             QPushButton {
-                background-color: transparent;
-                color: white;
-                font-size: 20px;
-                font-weight: bold;
-                border: none;
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 12px;
             }
             QPushButton:hover {
-                background-color: #e74c3c;
+                background: rgba(255, 255, 255, 0.15);
             }
         """)
         close_button.clicked.connect(self.minimizeToBubble)
@@ -329,13 +543,14 @@ class CircularWindow(QWidget):
         # Store bubble position
         self.bubble_position = self.pos()
         
-        # Remove transparent background attribute for expanded state
-        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        # Keep transparent background for glassmorphism
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         
         # Show chat UI
         self.title_bar.show()
         self.chat_scroll.show()
         self.input_container.show()
+        self.size_grip.show()
         
         # Change window flags (keep frameless for custom title bar)
         self.setWindowFlags(
@@ -344,11 +559,12 @@ class CircularWindow(QWidget):
             Qt.Tool
         )
         
-        # Resize to chat window size
+        # Resize to floating widget size - RESIZEABLE and SMALLER
         current_pos = self.pos()
-        self.setFixedSize(400, 600)
+        self.setMinimumSize(260, 320) # Minimum usable size
+        self.resize(280, 380)  # Initial compact size
         
-        # Adjust position to keep top-left corner in place
+        # Adjust position to keep it floating nicely
         self.move(current_pos)
         
         # Update state
@@ -368,6 +584,7 @@ class CircularWindow(QWidget):
         self.title_bar.hide()
         self.chat_scroll.hide()
         self.input_container.hide()
+        self.size_grip.hide()
         
         # Restore transparent background for circular shape
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -406,19 +623,47 @@ class CircularWindow(QWidget):
         self.input_field.setEnabled(False)
         self.send_button.setEnabled(False)
         
-        # Add user message to chat
-        self.message_area.append(f"<b>You:</b> {message}")
+        # Add user message with minimalist floating style
+        user_message = f"""
+        <div style="margin: 8px 0; text-align: right;">
+            <span style="background: rgba(0, 100, 255, 0.4); 
+                        border: 1px solid rgba(255, 255, 255, 0.1); 
+                        border-radius: 18px; 
+                        padding: 8px 16px; 
+                        color: white;
+                        display: inline-block;">
+                {message}
+            </span>
+        </div>
+        """
+        self.message_area.append(user_message)
         self.input_field.clear()
         
-        # Show loading indicator
-        self.message_area.append("<i>AI is typing...</i>")
+        # Show loading indicator with minimalist style
+        loading_msg = """
+        <div style="margin: 8px 0; color: rgba(255, 255, 255, 0.5); font-style: italic;">
+            AI is thinking...
+        </div>
+        """
+        self.message_area.append(loading_msg)
         
         # Scroll to bottom
         self.scrollToBottom()
         
         # Check if API key is available
         if not self.api_key:
-            self.message_area.append("<b>AI:</b> <span style='color: red;'>Error: API key not configured. Please set it in settings.</span>")
+            error_msg = """
+            <div style="background: rgba(255, 100, 100, 0.2); 
+                        border: 1px solid rgba(255, 150, 150, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        margin-right: 60px;
+                        color: rgba(255, 200, 200, 0.95);">
+                <b>AI:</b> Error: API key not configured. Please set it in settings.
+            </div>
+            """
+            self.message_area.append(error_msg)
             self.scrollToBottom()
             self.input_field.setEnabled(True)
             self.send_button.setEnabled(True)
@@ -440,8 +685,15 @@ class CircularWindow(QWidget):
         cursor.select(cursor.BlockUnderCursor)
         cursor.removeSelectedText()
         
-        # Add AI response
-        self.message_area.append(f"<b>AI:</b> {response_text}")
+        # Add AI response with minimalist styling
+        ai_message = f"""
+        <div style="margin: 12px 0; margin-right: 40px;">
+            <div style="color: rgba(255, 255, 255, 0.95); line-height: 1.4;">
+                {response_text}
+            </div>
+        </div>
+        """
+        self.message_area.append(ai_message)
         self.scrollToBottom()
     
     def onRetryAttempt(self, attempt_number, wait_time):
@@ -452,9 +704,19 @@ class CircularWindow(QWidget):
         cursor.select(cursor.BlockUnderCursor)
         cursor.removeSelectedText()
         
-        # Show retry message
+        # Show retry message with glassmorphism styling
         wait_seconds = int(wait_time) if wait_time >= 1 else round(wait_time, 1)
-        self.message_area.append(f"<i>Server busy, retrying... (Attempt {attempt_number}, waiting {wait_seconds}s)</i>")
+        retry_msg = f"""
+        <div style="background: rgba(255, 255, 255, 0.1); 
+                    border-radius: 16px; 
+                    padding: 12px 16px; 
+                    margin: 8px 0; 
+                    margin-right: 60px;
+                    color: rgba(255, 255, 255, 0.7);">
+            <i>Server busy, retrying... (Attempt {attempt_number}, waiting {wait_seconds}s)</i>
+        </div>
+        """
+        self.message_area.append(retry_msg)
         self.scrollToBottom()
     
     def onAIError(self, error_message):
@@ -465,8 +727,19 @@ class CircularWindow(QWidget):
         cursor.select(cursor.BlockUnderCursor)
         cursor.removeSelectedText()
         
-        # Add error message
-        self.message_area.append(f"<b>AI:</b> <span style='color: red;'>{error_message}</span>")
+        # Add error message with glassmorphism styling
+        error_msg = f"""
+        <div style="background: rgba(255, 100, 100, 0.2); 
+                    border: 1px solid rgba(255, 150, 150, 0.4); 
+                    border-radius: 16px; 
+                    padding: 12px 16px; 
+                    margin: 8px 0; 
+                    margin-right: 60px;
+                    color: rgba(255, 200, 200, 0.95);">
+            <b>AI:</b> {error_message}
+        </div>
+        """
+        self.message_area.append(error_msg)
         self.scrollToBottom()
     
     def onWorkerFinished(self):
@@ -525,8 +798,27 @@ class CircularWindow(QWidget):
                 self.expandToChat()
             
             # Show confirmation and send to AI for analysis
-            self.message_area.append(f"<b>System:</b> Screenshot captured: <code>{filepath}</code>")
-            self.message_area.append("<i>Analyzing screenshot...</i>")
+            system_msg = f"""
+            <div style="background: rgba(255, 255, 255, 0.1); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 255, 255, 0.8);">
+                <b>System:</b> Screenshot captured: <code style="background: rgba(0, 0, 0, 0.2); padding: 2px 6px; border-radius: 4px;">{filepath}</code>
+            </div>
+            """
+            self.message_area.append(system_msg)
+            analyzing_msg = """
+            <div style="background: rgba(255, 255, 255, 0.1); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        margin-right: 60px;
+                        color: rgba(255, 255, 255, 0.7);">
+                <i>Analyzing screenshot...</i>
+            </div>
+            """
+            self.message_area.append(analyzing_msg)
             self.scrollToBottom()
             
             # Send screenshot to AI for analysis
@@ -538,13 +830,34 @@ class CircularWindow(QWidget):
             self.raise_()
             if not self.is_expanded:
                 self.expandToChat()
-            self.message_area.append(f"<b>System:</b> <span style='color: red;'>Error capturing screenshot: {str(e)}</span>")
+            error_msg = f"""
+            <div style="background: rgba(255, 100, 100, 0.2); 
+                        border: 1px solid rgba(255, 150, 150, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 200, 200, 0.95);">
+                <b>System:</b> Error capturing screenshot: {str(e)}
+            </div>
+            """
+            self.message_area.append(error_msg)
             self.scrollToBottom()
     
     def analyzeScreenshot(self, filepath):
         """Send screenshot to AI for analysis"""
         if not self.api_key:
-            self.message_area.append("<b>AI:</b> <span style='color: red;'>Error: API key not configured.</span>")
+            error_msg = """
+            <div style="background: rgba(255, 100, 100, 0.2); 
+                        border: 1px solid rgba(255, 150, 150, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        margin-right: 60px;
+                        color: rgba(255, 200, 200, 0.95);">
+                <b>AI:</b> Error: API key not configured.
+            </div>
+            """
+            self.message_area.append(error_msg)
             self.scrollToBottom()
             return
         
@@ -570,8 +883,19 @@ class CircularWindow(QWidget):
         cursor.select(cursor.BlockUnderCursor)
         cursor.removeSelectedText()
         
-        # Add AI analysis
-        self.message_area.append(f"<b>AI:</b> {response_text}")
+        # Add AI analysis with glassmorphism styling
+        ai_message = f"""
+        <div style="background: rgba(255, 255, 255, 0.12); 
+                    border: 1px solid rgba(255, 255, 255, 0.25); 
+                    border-radius: 16px; 
+                    padding: 12px 16px; 
+                    margin: 8px 0; 
+                    margin-right: 60px;
+                    color: rgba(255, 255, 255, 0.95);">
+            <b style="color: rgba(255, 255, 255, 0.9);">AI:</b> {response_text}
+        </div>
+        """
+        self.message_area.append(ai_message)
         self.scrollToBottom()
     
     def onScreenshotWorkerFinished(self):
@@ -600,23 +924,92 @@ class CircularWindow(QWidget):
             sys.exit(0)
     
     def paintEvent(self, event):
-        # Only draw circle when in bubble state
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        
         if not self.is_expanded:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing)
-            
-            # Draw circular background
-            brush = QBrush(QColor(100, 150, 200, 255))  # Blue color
-            painter.setBrush(brush)
-            painter.setPen(Qt.NoPen)
-            
-            # Draw circle
-            painter.drawEllipse(0, 0, 50, 50)
+            # Draw glassmorphism bubble
+            self.paintBubble(painter)
         else:
-            # Draw background for expanded window
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing)
-            painter.fillRect(self.rect(), QColor(255, 255, 255))
+            # Draw glassmorphism chat window
+            self.paintChatWindow(painter)
+    
+    def paintBubble(self, painter):
+        """Paint dark glass circular bubble"""
+        size = 50
+        radius = size // 2
+        
+        # Draw dark gradient background circle
+        gradient = QLinearGradient(0, 0, size, size)
+        gradient.setColorAt(0, self.charcoal_color)
+        gradient.setColorAt(1, self.onyx_color)
+        
+        # Outer glow - very subtle for dark mode
+        glow_pen = QPen(QColor(255, 255, 255, 20))
+        glow_pen.setWidth(2)
+        painter.setPen(glow_pen)
+        painter.setBrush(QBrush(gradient))
+        painter.drawEllipse(2, 2, size - 4, size - 4)
+        
+        # Dark glass circle
+        glass_gradient = QLinearGradient(0, 0, size, size)
+        glass_gradient.setColorAt(0, QColor(255, 255, 255, 20))
+        glass_gradient.setColorAt(1, QColor(0, 0, 0, 40))
+        
+        painter.setPen(QPen(self.border_white, 1))
+        painter.setBrush(QBrush(glass_gradient))
+        painter.drawEllipse(3, 3, size - 6, size - 6)
+        
+        # Draw minimalist AI icon (sparkle)
+        icon_pen = QPen(QColor(255, 255, 255, 220), 1.5)
+        painter.setPen(icon_pen)
+        painter.setBrush(Qt.NoBrush)
+        
+        center_x, center_y = size // 2, size // 2
+        icon_size = 18
+        
+        path = QPainterPath()
+        path.moveTo(center_x, center_y - icon_size // 2)
+        path.lineTo(center_x, center_y + icon_size // 2)
+        path.moveTo(center_x - icon_size // 2, center_y)
+        path.lineTo(center_x + icon_size // 2, center_y)
+        
+        painter.drawPath(path)
+    
+    def paintChatWindow(self, painter):
+        """Paint minimalist dark mode glassmorphism chat window"""
+        rect = self.rect()
+        radius = 28.0  # Slightly more rounded for floating feel
+        
+        # Create rounded rect path for clipping
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(0.0, 0.0, float(rect.width()), float(rect.height()), radius, radius)
+        
+        # Clip painter so everything drawn stays within rounded corners
+        painter.setClipPath(clip_path)
+        
+        # Draw base gradient (very dark and subtle)
+        gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        gradient.setColorAt(0, self.charcoal_color)
+        gradient.setColorAt(1, self.onyx_color)
+        painter.fillRect(rect, QBrush(gradient))
+        
+        # Glassmorphism container path
+        path = QPainterPath()
+        path.addRoundedRect(0.0, 0.0, float(rect.width()), float(rect.height()), radius, radius)
+        
+        # Minimal translucent fill
+        painter.setBrush(QBrush(self.dark_glass))
+        painter.setPen(QPen(self.border_white, 1))
+        painter.drawPath(path)
+        
+        # Very subtle rim lighting
+        inner_path = QPainterPath()
+        inner_path.addRoundedRect(0.5, 0.5, float(rect.width() - 1), float(rect.height() - 1), radius - 0.5, radius - 0.5)
+        painter.setPen(QPen(self.rim_light, 0.5))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(inner_path)
     
     def mousePressEvent(self, event):
         """Handle mouse press - distinguish between click and drag"""
@@ -652,7 +1045,17 @@ class CircularWindow(QWidget):
             event.accept()
 
 if __name__ == '__main__':
+    # Enable high DPI support
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    
     app = QApplication(sys.argv)
+    
+    # Set modern sans-serif font as default
+    font = QFont("Segoe UI", 10)
+    font.setStyleHint(QFont.SansSerif)
+    app.setFont(font)
+    
     window = CircularWindow()
     window.show()
     sys.exit(app.exec_())
