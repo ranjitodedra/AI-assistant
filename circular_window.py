@@ -5,12 +5,14 @@ import io
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QTextEdit, QLineEdit, QPushButton, QLabel, QScrollArea, QDialog, QSizeGrip, QMenu)
-from PyQt5.QtGui import QCursor
+from PyQt5.QtGui import QCursor, QGuiApplication
 from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QRect, QSize, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty, QObject
 from PyQt5.QtGui import (QPainter, QBrush, QColor, QFont, QLinearGradient, 
                         QPen, QPainterPath, QFontMetrics, QGradient)
 from PyQt5.QtWidgets import QGraphicsDropShadowEffect, QGraphicsBlurEffect
 from google import genai
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 from PIL import ImageGrab, Image
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, RetryCallState
 
@@ -262,7 +264,11 @@ class GeminiWorker(QThread):
         # Add system prompt if provided (prepended to message)
         final_message = self.message
         if self.system_prompt:
-            final_message = self.system_prompt.format(user_message=self.message)
+            # Only format when the placeholder is present; avoids JSON brace errors
+            if "{user_message}" in self.system_prompt:
+                final_message = self.system_prompt.format(user_message=self.message)
+            else:
+                final_message = self.system_prompt
             
         contents.append(final_message)
         
@@ -377,12 +383,15 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         
-        # Full screen geometry
-        screen = QApplication.primaryScreen().geometry()
-        self.setGeometry(0, 0, screen.width(), screen.height())
+        # Full screen geometry (virtual screen for multi-monitor/DPI)
+        screen = QGuiApplication.primaryScreen().virtualGeometry()
+        self.setGeometry(screen.x(), screen.y(), screen.width(), screen.height())
         
         self.shapes = []
         self._pulse_time = 0.0
+        self.edit_mode = False
+        self._selected_shape = None
+        self._drag_offset = None
         
         # Step management
         self.all_shapes = []
@@ -393,6 +402,18 @@ class OverlayWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.updateAnimations)
         self.timer.start(33)
+
+    def setEditMode(self, enabled):
+        """Enable/disable interactive editing of overlay shapes"""
+        self.edit_mode = enabled
+        flags = self.windowFlags()
+        if enabled:
+            flags &= ~Qt.WindowTransparentForInput
+        else:
+            flags |= Qt.WindowTransparentForInput
+        self.setWindowFlags(flags)
+        self.show()
+        self.update()
         
     def loadShapes(self, shapes):
         """Load a sequence of shapes"""
@@ -437,6 +458,66 @@ class OverlayWindow(QWidget):
     def clearLayout(self):
         self.shapes = []
         self.all_shapes = []
+        self.update()
+
+    def _clampRect(self, rect):
+        """Clamp rectangle to overlay bounds"""
+        bounds = self.rect()
+        x = max(0, min(rect.x(), bounds.width() - 10))
+        y = max(0, min(rect.y(), bounds.height() - 10))
+        w = max(10, min(rect.width(), bounds.width() - x))
+        h = max(10, min(rect.height(), bounds.height() - y))
+        return QRect(x, y, w, h)
+
+    def mousePressEvent(self, event):
+        if not self.edit_mode or not self.shapes:
+            return
+        if event.button() == Qt.LeftButton:
+            pos = event.pos()
+            # Prefer shape under cursor, otherwise first shape
+            target = None
+            for shape in self.shapes:
+                if shape.rect.contains(pos):
+                    target = shape
+                    break
+            if not target:
+                target = self.shapes[0]
+            self._selected_shape = target
+            self._drag_offset = pos - target.rect.topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if not self.edit_mode or not self._selected_shape or not self._drag_offset:
+            return
+        if event.buttons() == Qt.LeftButton:
+            pos = event.pos()
+            new_top_left = pos - self._drag_offset
+            new_rect = QRect(new_top_left, self._selected_shape.rect.size())
+            self._selected_shape.rect = self._clampRect(new_rect)
+            self.update()
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if not self.edit_mode:
+            return
+        self._selected_shape = None
+        self._drag_offset = None
+
+    def wheelEvent(self, event):
+        if not self.edit_mode or not self.shapes:
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        step = 6 if delta > 0 else -6
+        shape = self._selected_shape or self.shapes[0]
+        rect = shape.rect
+        center = rect.center()
+        new_w = max(10, rect.width() + step)
+        new_h = max(10, rect.height() + step)
+        new_rect = QRect(0, 0, new_w, new_h)
+        new_rect.moveCenter(center)
+        shape.rect = self._clampRect(new_rect)
         self.update()
         
     def updateAnimations(self):
@@ -548,6 +629,15 @@ class FollowAlongManager:
         self.same_screen_count = 0
         self.tts_engine = None
         
+        # Guided task state
+        self.guided_mode = False
+        self.current_task = None  # User's goal (e.g., "open a new document")
+        self.current_step = 0  # Which step we're on
+        self.total_steps = 0  # Estimated total steps
+        self.pending_action = None  # Description of action user needs to take
+        self.waiting_for_completion = False  # True when showing overlay, waiting for user action
+        self.step_start_hash = None  # Screen hash when step overlay was shown
+        
         # Initialize TTS
         try:
             import pyttsx3
@@ -567,7 +657,51 @@ class FollowAlongManager:
 
     def stop(self):
         self.active = False
+        self.resetGuidedTask()
         self.speak("Guidance stopped.")
+    
+    def startGuidedTask(self, goal):
+        """Start a new guided navigation task"""
+        self.guided_mode = True
+        self.current_task = goal
+        self.current_step = 1
+        self.total_steps = 0  # Will be updated from AI response
+        self.waiting_for_completion = False
+        self.pending_action = None
+        self.speak(f"Starting guided task: {goal}")
+        print(f"[GuidedNav] Started task: {goal}")
+    
+    def resetGuidedTask(self):
+        """Reset guided task state"""
+        self.guided_mode = False
+        self.current_task = None
+        self.current_step = 0
+        self.total_steps = 0
+        self.pending_action = None
+        self.waiting_for_completion = False
+        self.step_start_hash = None
+    
+    def setStepShown(self, action_description, screen_hash=None):
+        """Called when a step overlay is displayed"""
+        self.pending_action = action_description
+        self.waiting_for_completion = True
+        self.step_start_hash = screen_hash
+        if action_description:
+            self.speak(action_description)
+        print(f"[GuidedNav] Step {self.current_step} shown: {action_description}")
+    
+    def advanceStep(self):
+        """Advance to the next step"""
+        self.current_step += 1
+        self.waiting_for_completion = False
+        self.pending_action = None
+        print(f"[GuidedNav] Advancing to step {self.current_step}")
+    
+    def completeTask(self):
+        """Mark the guided task as complete"""
+        self.speak("Task completed!")
+        print(f"[GuidedNav] Task completed: {self.current_task}")
+        self.resetGuidedTask()
 
     def speak(self, text):
         """Speak text using TTS engine"""
@@ -609,6 +743,18 @@ class FollowAlongManager:
         except Exception as e:
             print(f"Diff check failed: {e}")
             return False
+    
+    def checkStepCompletion(self, current_hash):
+        """Check if user completed the current step (screen changed after action)"""
+        if not self.waiting_for_completion:
+            return False
+        
+        # If screen hash is different from when we showed the step, user likely took action
+        if self.step_start_hash is not None and current_hash != self.step_start_hash:
+            print(f"[GuidedNav] Screen changed after step {self.current_step}")
+            return True
+        return False
+
 
 class ContextPanel(QWidget):
     """Panel to display real-time AI context analysis"""
@@ -771,6 +917,7 @@ class GlobalHotkeyManager(QObject):
     """Manages system-wide keyboard shortcuts"""
     # Signals for main thread actions
     sig_toggle_overlay = pyqtSignal()
+    sig_toggle_overlay_edit = pyqtSignal()
     sig_ask_ai = pyqtSignal()
     sig_next_step = pyqtSignal()
     sig_clear_overlay = pyqtSignal()
@@ -790,6 +937,8 @@ class GlobalHotkeyManager(QObject):
             # Register Hotkeys
             # Ctrl+Shift+G: Toggle Overlay
             keyboard.add_hotkey('ctrl+shift+g', self.sig_toggle_overlay.emit)
+            # Ctrl+Shift+E: Toggle Overlay Edit Mode
+            keyboard.add_hotkey('ctrl+shift+e', self.sig_toggle_overlay_edit.emit)
             # Ctrl+Shift+A: Ask AI about screen
             keyboard.add_hotkey('ctrl+shift+a', self.sig_ask_ai.emit)
             # Ctrl+Shift+N: Next Step
@@ -835,6 +984,12 @@ class CircularWindow(QWidget):
         self.latest_screenshot = None
         self.last_capture_time = None
         self.is_analyzing = False  # Flag to prevent overlapping analysis calls
+        self.last_overlay_query = None
+        self.last_overlay_retry = 0
+        self.last_overlay_image = None
+        self.last_ocr_candidates = None
+        self.pending_candidate_selection = None
+        self.debug_overlay_candidates = False  # Set True to see all matching OCR boxes
         
         
         # Follow-Along Manager
@@ -843,6 +998,7 @@ class CircularWindow(QWidget):
         # Hotkey Manager
         self.hotkey_manager = GlobalHotkeyManager(self)
         self.hotkey_manager.sig_toggle_overlay.connect(self.toggleOverlayVisibility)
+        self.hotkey_manager.sig_toggle_overlay_edit.connect(self.toggleOverlayEditMode)
         self.hotkey_manager.sig_ask_ai.connect(self.triggerAskAI)
         self.hotkey_manager.sig_next_step.connect(self.triggerNextStep)
         self.hotkey_manager.sig_clear_overlay.connect(self.triggerClearOverlay)
@@ -912,7 +1068,7 @@ class CircularWindow(QWidget):
     
     def centerWindow(self):
         # Get screen geometry
-        screen = QApplication.primaryScreen().geometry()
+        screen = QGuiApplication.primaryScreen().geometry()
         # Calculate center position
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2
@@ -1214,6 +1370,34 @@ class CircularWindow(QWidget):
         message = self.input_field.text().strip()
         if not message:
             return
+
+        # Handle pending candidate selection by OCR id
+        if self.pending_candidate_selection:
+            if message.lower() in ("cancel", "clear", "stop"):
+                self.pending_candidate_selection = None
+                self.message_area.append("""
+                <div style="background: rgba(255, 255, 255, 0.1); 
+                            border-radius: 12px; 
+                            padding: 8px 12px; 
+                            margin: 5px 0;
+                            color: rgba(255, 255, 255, 0.8);">
+                    ✅ Selection cancelled.
+                </div>
+                """)
+                self.scrollToBottom()
+                self.input_field.clear()
+                return
+            if message.isdigit():
+                ocr_id = int(message)
+                candidates = self.pending_candidate_selection.get("candidates", [])
+                padding = self.pending_candidate_selection.get("padding", 5)
+                source_image = self.pending_candidate_selection.get("image")
+                match = next((c for c in candidates if c.get("ocr_id") == ocr_id), None)
+                if match:
+                    self.pending_candidate_selection = None
+                    self._drawOverlayFromCandidate(match, padding, source_image)
+                    self.input_field.clear()
+                    return
         
         # Disable input while processing
         self.input_field.setEnabled(False)
@@ -1265,31 +1449,39 @@ class CircularWindow(QWidget):
             self.send_button.setEnabled(True)
             return
         
-        # Create and start worker thread logic...
-        
         # Determine context and prompts
         current_image = None
         system_prompt = None
+        is_overlay_command = False
         
         # Get screen resolution
-        screen_geom = QApplication.primaryScreen().geometry()
+        screen_geom = QGuiApplication.primaryScreen().virtualGeometry()
         res_info = f"Screen Resolution: {screen_geom.width()}x{screen_geom.height()}"
         
-        # Use monitored screenshot if available to provide context
-        if self.latest_screenshot:
+        # Check if this is an overlay/highlight command
+        overlay_keywords = ['rectangle', 'highlight', 'circle', 'box', 'mark', 'outline', 'draw', 'show me', 'point to', 'where is']
+        message_lower = message.lower()
+        is_overlay_command = any(keyword in message_lower for keyword in overlay_keywords)
+        
+        # Use monitored screenshot if available
+        if self.latest_screenshot and self.screen_monitoring_enabled:
             current_image = self.latest_screenshot
-            system_prompt = f"""
-            You are a screen guidance assistant. User asked: "{{user_message}}"
-            Based on the screenshot, provide step-by-step instructions.
-            {res_info}: Coordinates must be absolute pixels relative to top-left (0,0).
             
-            CRITICAL: Visually mark UI elements using SHAPE commands.
-            Format: SHAPE[type:box|arrow|circle, x:int, y:int, w:int, h:int, color:str, label:"str", step:int]
-            
-            Example:
-            1. Click File. SHAPE[type:box, x:10, y:20, w:50, h:20, color:red, label:"Click File", step:1]
-            2. Select Open. SHAPE[type:box, x:10, y:100, w:100, h:30, color:blue, label:"Select Open", step:2]
-            """
+            if is_overlay_command:
+                self.last_overlay_query = message
+                self.last_overlay_retry = 0
+                # Capture a fresh screenshot for accurate placement
+                self.last_overlay_image = self._captureOverlayScreenshot()
+                self._handleOcrOverlayRequest(message, self.last_overlay_image)
+                return
+            else:
+                # Regular conversational response with screenshot context
+                system_prompt = f"""You are a helpful AI assistant. The user has screen monitoring enabled.
+{res_info}
+
+Analyze the screenshot if relevant to the user's question and provide a helpful response.
+
+User message: {{user_message}}"""
         
         self.gemini_worker = GeminiWorker(message, self.api_key, image_data=current_image, system_prompt=system_prompt)
         self.gemini_worker.response_received.connect(self.onAIResponse)
@@ -1306,14 +1498,38 @@ class CircularWindow(QWidget):
         cursor.select(cursor.BlockUnderCursor)
         cursor.removeSelectedText()
         
+        # Check for task completion in guided mode
+        if self.follow_manager.guided_mode and "TASK_COMPLETE" in response_text.upper():
+            self.follow_manager.completeTask()
+            complete_msg = """
+            <div style="background: rgba(80, 200, 100, 0.2); 
+                        border: 1px solid rgba(80, 200, 100, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        color: rgba(200, 255, 200, 0.95);">
+                ✅ <b>Task Complete!</b>
+            </div>
+            """
+            self.message_area.append(complete_msg)
+            self.scrollToBottom()
+            return
+        
         # Parse SHAPE commands (regex extraction)
         import re
         parsed_shapes = []
         clean_text_lines = []
+        action_description = None
         
         # Regex to match SHAPE[...] block
-        # Matches SHAPE[ ... ] non-greedily
         shape_pattern = re.compile(r'SHAPE\[(.*?)\]')
+        # Regex to match ACTION: line
+        action_pattern = re.compile(r'^ACTION:\s*(.+)$', re.IGNORECASE | re.MULTILINE)
+        
+        # Extract action description
+        action_match = action_pattern.search(response_text)
+        if action_match:
+            action_description = action_match.group(1).strip()
         
         lines = response_text.split('\n')
         for line in lines:
@@ -1327,12 +1543,7 @@ class CircularWindow(QWidget):
                  for match_str in matches:
                      try:
                          # Parse key:value pairs
-                         # type:circle, x:500, label:"Click here"
                          params = {}
-                         # Split by comma but respect quotes is hard with simple split, 
-                         # simplest approach: split by comma, clean whitespace
-                         # Better: regex for key:value
-                         
                          parts = match_str.split(',')
                          for part in parts:
                              if ':' in part:
@@ -1347,7 +1558,7 @@ class CircularWindow(QWidget):
                              y=int(params.get('y', 0)),
                              width=int(params.get('w', 100)),
                              height=int(params.get('h', 100)),
-                             color=params.get('color', 'red'),
+                             color=params.get('color', 'green'),
                              label=params.get('label', ''),
                              step=int(params.get('step', 1))
                          )
@@ -1360,7 +1571,7 @@ class CircularWindow(QWidget):
         # Load parsing results into overlay
         if parsed_shapes:
             # COORDINATE VALIDATION
-            screen_geom = QApplication.primaryScreen().geometry()
+            screen_geom = QGuiApplication.primaryScreen().virtualGeometry()
             sw, sh = screen_geom.width(), screen_geom.height()
             
             valid_shapes = []
@@ -1376,6 +1587,11 @@ class CircularWindow(QWidget):
                 valid_shapes.append(s)
                 
             self.overlay.loadShapes(valid_shapes)
+            
+            # If in guided mode, set step as shown and wait for completion
+            if self.follow_manager.guided_mode:
+                current_hash = getattr(self, 'last_screen_hash_val', None)
+                self.follow_manager.setStepShown(action_description, current_hash)
         
         clean_text = '\n'.join(clean_text_lines)
         
@@ -1389,6 +1605,392 @@ class CircularWindow(QWidget):
         """
         self.message_area.append(ai_message)
         self.scrollToBottom()
+    
+    def onOverlayJSONResponse(self, response_text):
+        """Handle JSON overlay response from Gemini"""
+        import json
+        import re
+        
+        # DEBUG: Print raw response
+        print(f"[DEBUG] Raw AI response: {response_text[:500]}")
+        
+        # Remove loading indicator
+        cursor = self.message_area.textCursor()
+        cursor.movePosition(cursor.End)
+        cursor.select(cursor.BlockUnderCursor)
+        cursor.removeSelectedText()
+        
+        try:
+            # Try multiple methods to extract JSON
+            clean_response = response_text.strip()
+            
+            # Method 1: Remove markdown code fences
+            if "```" in clean_response:
+                # Find content between code fences
+                match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', clean_response)
+                if match:
+                    clean_response = match.group(1).strip()
+            
+            # Method 2: Find JSON object with regex
+            if not clean_response.startswith('{'):
+                # Try to find a JSON object anywhere in the response
+                match = re.search(r'\{[\s\S]*"overlays"[\s\S]*\}', clean_response)
+                if match:
+                    clean_response = match.group(0)
+            
+            # Parse JSON
+            data = json.loads(clean_response)
+            
+            # Handle list vs dict
+            overlays = []
+            if isinstance(data, dict):
+                overlays = data.get("overlays", [])
+            elif isinstance(data, list):
+                # Maybe AI returned raw list of overlays?
+                overlays = data
+            
+            if not overlays or not isinstance(overlays, list):
+                # No overlays found
+                msg = """
+                <div style="background: rgba(255, 200, 100, 0.2); 
+                            border: 1px solid rgba(255, 200, 100, 0.4); 
+                            border-radius: 16px; 
+                            padding: 12px 16px; 
+                            margin: 8px 0; 
+                            color: rgba(255, 255, 200, 0.95);">
+                    ⚠️ Could not locate the element on screen.
+                </div>
+                """
+                self.message_area.append(msg)
+                self.scrollToBottom()
+                return
+            
+            # Validate and create shapes
+            screen_geom = QGuiApplication.primaryScreen().virtualGeometry()
+            sw, sh = screen_geom.width(), screen_geom.height()
+            # Scale coordinates from screenshot space to screen space (handles DPI scaling)
+            sx = 1.0
+            sy = 1.0
+            source_image = self.last_overlay_image or self.latest_screenshot
+            if source_image:
+                try:
+                    img_w, img_h = source_image.size
+                    if img_w > 0 and img_h > 0:
+                        sx = sw / float(img_w)
+                        sy = sh / float(img_h)
+                except Exception:
+                    sx = 1.0
+                    sy = 1.0
+            
+            shapes = []
+            for overlay in overlays:
+                try:
+                    x = int(overlay.get("x", 0))
+                    y = int(overlay.get("y", 0))
+                    w = int(overlay.get("width", 100))
+                    h = int(overlay.get("height", 50))
+                    color = overlay.get("color", "red")
+                    label = overlay.get("label", "")
+                    shape_type = overlay.get("type", "rectangle").upper()
+                    
+                    # Map type names
+                    if shape_type in ["RECTANGLE", "BOX", "RECT"]:
+                        shape_type = "RECT"
+                    elif shape_type in ["CIRCLE", "ELLIPSE"]:
+                        shape_type = "CIRCLE"
+                    
+                    # Scale to screen coordinates (DPI-aware)
+                    x = int(x * sx)
+                    y = int(y * sy)
+                    w = int(w * sx)
+                    h = int(h * sy)
+
+                    # Normalize tiny boxes (ensure visible size)
+                    min_w = 12
+                    min_h = 12
+                    if w < min_w:
+                        w = min_w
+                    if h < min_h:
+                        h = min_h
+
+                    # Clamp to screen bounds
+                    x = max(0, min(x, sw - 10))
+                    y = max(0, min(y, sh - 10))
+                    w = min(w, sw - x)
+                    h = min(h, sh - y)
+                    
+                    shape = OverlayShape(shape_type, x, y, w, h, color, label, step=1)
+                    shapes.append(shape)
+                    
+                except (ValueError, TypeError) as e:
+                    print(f"Error parsing overlay: {e}")
+                    continue
+            
+            if shapes:
+                self.overlay.loadShapes(shapes)
+                # Leave edit mode off after new overlays
+                self.overlay.setEditMode(False)
+                
+                # Success message
+                msg = f"""
+                <div style="background: rgba(80, 200, 100, 0.2); 
+                            border: 1px solid rgba(80, 200, 100, 0.4); 
+                            border-radius: 16px; 
+                            padding: 12px 16px; 
+                            margin: 8px 0; 
+                            color: rgba(200, 255, 200, 0.95);">
+                    ✅ Drew {len(shapes)} overlay(s) on screen
+                </div>
+                """
+                self.message_area.append(msg)
+            else:
+                msg = """
+                <div style="background: rgba(255, 200, 100, 0.2); 
+                            border: 1px solid rgba(255, 200, 100, 0.4); 
+                            border-radius: 16px; 
+                            padding: 12px 16px; 
+                            margin: 8px 0; 
+                            color: rgba(255, 255, 200, 0.95);">
+                    ⚠️ No valid overlays could be created.
+                </div>
+                """
+                self.message_area.append(msg)
+            # Warn if overlays are suspiciously small after scaling
+            tiny_shapes = [s for s in shapes if s.rect.width() <= 12 or s.rect.height() <= 12]
+            if tiny_shapes:
+                if self.last_overlay_query and self.last_overlay_retry < 1:
+                    self.last_overlay_retry += 1
+                    retry_msg = """
+                    <div style="background: rgba(80, 200, 255, 0.15); 
+                                border: 1px solid rgba(80, 200, 255, 0.3); 
+                                border-radius: 12px; 
+                                padding: 8px 12px; 
+                                margin: 6px 0; 
+                                color: rgba(255, 255, 255, 0.9);">
+                        🔁 Retrying with a larger bounding box...
+                    </div>
+                    """
+                    self.message_area.append(retry_msg)
+                    self.scrollToBottom()
+                    self._requestOverlayForMessage(self.last_overlay_query, padding_note="Increase the box by 15% in width and height to fully cover the element.")
+                    return
+                warn_msg = """
+                <div style="background: rgba(255, 180, 80, 0.2); 
+                            border: 1px solid rgba(255, 180, 80, 0.4); 
+                            border-radius: 12px; 
+                            padding: 8px 12px; 
+                            margin: 6px 0; 
+                            color: rgba(255, 230, 200, 0.95);">
+                    ⚠️ The highlight is very small. Try asking for a more specific target.
+                </div>
+                """
+                self.message_area.append(warn_msg)
+                
+        except json.JSONDecodeError as e:
+            # JSON parsing failed
+            error_msg = f"""
+            <div style="background: rgba(255, 100, 100, 0.2); 
+                        border: 1px solid rgba(255, 150, 150, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 200, 200, 0.95);">
+                <b>Error:</b> Could not parse response as JSON.<br>
+                <small>{str(e)}</small>
+            </div>
+            """
+            self.message_area.append(error_msg)
+            print(f"JSON parse error: {e}")
+            print(f"Raw response: {response_text[:500]}")
+            
+        except Exception as e:
+            error_msg = f"""
+            <div style="background: rgba(255, 100, 100, 0.2); 
+                        border: 1px solid rgba(255, 150, 150, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 200, 200, 0.95);">
+                <b>Error:</b> {str(e)}
+            </div>
+            """
+            self.message_area.append(error_msg)
+            
+        self.scrollToBottom()
+
+    def onOcrSelectionResponse(self, response_text):
+        """Handle OCR candidate selection response"""
+        import json
+        import re
+
+        # Remove loading indicator
+        cursor = self.message_area.textCursor()
+        cursor.movePosition(cursor.End)
+        cursor.select(cursor.BlockUnderCursor)
+        cursor.removeSelectedText()
+
+        # Extract JSON
+        clean_response = response_text.strip()
+        if "```" in clean_response:
+            match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', clean_response)
+            if match:
+                clean_response = match.group(1).strip()
+
+        try:
+            data = json.loads(clean_response)
+        except Exception as e:
+            self.message_area.append(f"""
+            <div style="background: rgba(255, 100, 100, 0.2); 
+                        border: 1px solid rgba(255, 150, 150, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 200, 200, 0.95);">
+                <b>Error:</b> Could not parse selection JSON.<br>
+                <small>{str(e)}</small>
+            </div>
+            """)
+            self.scrollToBottom()
+            return
+
+        selection = data.get("selection")
+        candidates = self.last_ocr_candidates or []
+        source_image = self.last_overlay_image
+
+        # Enforce confidence rule
+        if selection and float(selection.get("confidence", 0)) < 0.6:
+            selection = None
+
+        # Validate selection against matching rules
+        if selection:
+            selected_id = selection.get("ocr_id")
+            padding = selection.get("padding", 5)
+            valid_id = self._validateOcrSelection(selected_id, candidates, self.last_overlay_query)
+            if valid_id is None:
+                selection = None
+            else:
+                selected_candidate = next((c for c in candidates if c.get("ocr_id") == valid_id), None)
+                if selected_candidate:
+                    self._drawOverlayFromCandidate(selected_candidate, padding, source_image)
+                    return
+                selection = None
+
+        # If selection is null, show top 5 candidates and wait for user
+        top_candidates = self._topCandidateList(candidates, self.last_overlay_query, limit=5)
+        if not top_candidates:
+            self.message_area.append("""
+            <div style="background: rgba(255, 200, 100, 0.2); 
+                        border: 1px solid rgba(255, 200, 100, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 255, 200, 0.95);">
+                ⚠️ No OCR candidates matched. Try a clearer target.
+            </div>
+            """)
+            self.scrollToBottom()
+            return
+
+        choices = "".join(
+            f"<div>• <b>{c['ocr_id']}</b>: {c['text']}</div>"
+            for c in top_candidates
+        )
+        self.message_area.append(f"""
+        <div style="background: rgba(255, 255, 255, 0.08); 
+                    border: 1px solid rgba(255, 255, 255, 0.15); 
+                    border-radius: 12px; 
+                    padding: 10px 12px; 
+                    margin: 8px 0; 
+                    color: rgba(255, 255, 255, 0.85);">
+            I found multiple candidates. Reply with the OCR id to highlight (or type 'cancel'):<br>
+            {choices}
+        </div>
+        """)
+        self.scrollToBottom()
+        self.pending_candidate_selection = {
+            "candidates": top_candidates,
+            "padding": 5,
+            "image": source_image
+        }
+
+    def _tokenize(self, text):
+        import re
+        return [t for t in re.split(r"[\W_]+", text.lower()) if t]
+
+    def _levenshtein(self, a, b):
+        if a == b:
+            return 0
+        if len(a) == 0:
+            return len(b)
+        if len(b) == 0:
+            return len(a)
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cost = 0 if ca == cb else 1
+                cur.append(min(
+                    prev[j] + 1,
+                    cur[j - 1] + 1,
+                    prev[j - 1] + cost
+                ))
+            prev = cur
+        return prev[-1]
+
+    def _validateOcrSelection(self, selected_id, candidates, query):
+        if not selected_id or not candidates:
+            return None
+        query_tokens = self._tokenize(query or "")
+        if not query_tokens:
+            return None
+
+        exact = []
+        fuzzy = []
+        for c in candidates:
+            text_tokens = self._tokenize(c.get("text", ""))
+            if any(qt in text_tokens for qt in query_tokens):
+                exact.append(c)
+                continue
+            if c.get("confidence", 0) >= 0.6:
+                for qt in query_tokens:
+                    if any(self._levenshtein(qt, tt) <= 2 for tt in text_tokens):
+                        fuzzy.append(c)
+                        break
+
+        def smallest_area(items):
+            return min(items, key=lambda x: x.get("width", 0) * x.get("height", 0), default=None)
+
+        if exact:
+            best = smallest_area(exact)
+        elif fuzzy:
+            best = smallest_area(fuzzy)
+        else:
+            return None
+
+        if best and best.get("ocr_id") == selected_id:
+            return selected_id
+        return None
+
+    def _topCandidateList(self, candidates, query, limit=5):
+        # Prefer exact matches, then fuzzy, else highest confidence
+        query_tokens = self._tokenize(query or "")
+        exact = []
+        fuzzy = []
+        for c in candidates:
+            text_tokens = self._tokenize(c.get("text", ""))
+            if any(qt in text_tokens for qt in query_tokens):
+                exact.append(c)
+                continue
+            if c.get("confidence", 0) >= 0.6:
+                for qt in query_tokens:
+                    if any(self._levenshtein(qt, tt) <= 2 for tt in text_tokens):
+                        fuzzy.append(c)
+                        break
+        if exact:
+            return sorted(exact, key=lambda x: x.get("width", 0) * x.get("height", 0))[:limit]
+        if fuzzy:
+            return sorted(fuzzy, key=lambda x: x.get("width", 0) * x.get("height", 0))[:limit]
+        return sorted(candidates, key=lambda x: x.get("confidence", 0), reverse=True)[:limit]
     
     def onRetryAttempt(self, attempt_number, wait_time):
         """Handle retry attempt - show user feedback"""
@@ -1447,6 +2049,351 @@ class CircularWindow(QWidget):
         """Scroll chat area to bottom"""
         scrollbar = self.message_area.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def _requestOverlayForMessage(self, message, padding_note=None, image_override=None):
+        """Send overlay-only request with strict JSON output"""
+        screen_geom = QGuiApplication.primaryScreen().virtualGeometry()
+        pad_rule = ""
+        if padding_note:
+            pad_rule = f"\n- {padding_note}"
+
+        image = image_override or self.latest_screenshot
+        img_w, img_h = (0, 0)
+        if image:
+            try:
+                img_w, img_h = image.size
+            except Exception:
+                img_w, img_h = (0, 0)
+
+        system_prompt = f"""Find the exact UI element in this screenshot: "{message}"
+
+Return ONLY this JSON (replace numbers with actual pixel coordinates):
+{{"overlays":[{{"type":"rectangle","x":100,"y":200,"width":120,"height":40,"color":"red","label":"target"}}]}}
+
+Rules:
+- The rectangle MUST fully cover the element's visible bounds (left/right/top/bottom).
+- If the target is a labeled UI item (menu/tab/button), make the box tight around the visible text.
+- If unsure, make the box slightly larger to fully cover the element.{pad_rule}
+- Use absolute pixel coordinates from the top-left of the screenshot.
+- Output ONLY raw JSON, no markdown, no extra text.
+
+Screenshot size is {img_w}x{img_h} pixels.
+Screen is {screen_geom.width()}x{screen_geom.height()} pixels.
+x=pixels from left, y=pixels from top (use screenshot size for coordinates)."""
+
+        print(f"[DEBUG] Overlay command: {message}")
+
+        self.gemini_worker = GeminiWorker(message, self.api_key, image_data=image, system_prompt=system_prompt)
+        self.gemini_worker.response_received.connect(self.onOverlayJSONResponse)
+        self.gemini_worker.error_occurred.connect(self.onAIError)
+        self.gemini_worker.retry_attempt.connect(self.onRetryAttempt)
+        self.gemini_worker.finished.connect(self.onWorkerFinished)
+        self.gemini_worker.start()
+
+    def _handleOcrOverlayRequest(self, message, image):
+        """Hybrid overlay: try OCR-first, fall back to LLM coordinates if no match"""
+        print(f"[DEBUG] _handleOcrOverlayRequest: message='{message}'")
+        candidates = self._extractOcrCandidates(image)
+        self.last_ocr_candidates = candidates
+        print(f"[DEBUG] OCR found {len(candidates)} total candidates")
+
+        # Step 1: Try local OCR matching (no LLM needed)
+        matched = self._localOcrMatch(message, candidates)
+        print(f"[DEBUG] Local match found {len(matched) if matched else 0} matching candidates")
+        
+        if matched:
+            # Found exact/fuzzy match - use smallest bounding box
+            if self.debug_overlay_candidates:
+                # Debug: show only matched candidates, not all
+                self._renderFilteredCandidates(matched, image)
+            
+            # Auto-select the smallest box (tightest match)
+            best = min(matched, key=lambda c: c["width"] * c["height"])
+            self._drawOverlayFromCandidate(best, padding=5, source_image=image)
+            
+            msg = f"""
+            <div style="background: rgba(80, 200, 100, 0.2); 
+                        border: 1px solid rgba(80, 200, 100, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        color: rgba(200, 255, 200, 0.95);">
+                ✅ Found via OCR: "{best['text']}" (id: {best['ocr_id']})
+            </div>
+            """
+            self.message_area.append(msg)
+            self.scrollToBottom()
+            # Re-enable input (no worker was used)
+            self.input_field.setEnabled(True)
+            self.send_button.setEnabled(True)
+            self.input_field.setFocus()
+            return
+        
+        # Step 2: OCR didn't find it - fall back to LLM coordinate method
+        print(f"[DEBUG] No OCR match, falling back to LLM coordinates")
+        fallback_msg = """
+        <div style="background: rgba(255, 200, 100, 0.15); 
+                    border: 1px solid rgba(255, 200, 100, 0.3); 
+                    border-radius: 12px; 
+                    padding: 8px 12px; 
+                    margin: 6px 0; 
+                    color: rgba(255, 255, 200, 0.9);">
+            🔄 OCR didn't find a match. Falling back to AI vision...
+        </div>
+        """
+        self.message_area.append(fallback_msg)
+        self.scrollToBottom()
+        
+        # Use the existing LLM coordinate method
+        print(f"[DEBUG] Calling _requestOverlayForMessage")
+        self._requestOverlayForMessage(message, image_override=image)
+    
+    def _localOcrMatch(self, query, candidates):
+        """Find OCR candidates matching the query locally (no LLM)"""
+        import re
+        
+        if not candidates:
+            return []
+        
+        # Tokenize query: split on whitespace and punctuation
+        query_tokens = set(re.split(r'[\s\W]+', query.lower()))
+        # Remove common/filler words - be aggressive to focus on actual target
+        stop_words = {
+            'make', 'rectangle', 'on', 'the', 'a', 'an', 'highlight', 'box', 'draw', 
+            'show', 'me', 'over', 'around', 'it', 'this', 'that', 'there', 'is', 'in',
+            'vs', 'code', 'option', 'button', 'menu', 'tab', 'click', 'select', 'find',
+            'where', 'put', 'place', 'create', 'add', 'to', 'of', 'for', 'with', 'at',
+            'and', 'or', 'be', 'can', 'please', 'just', 'only', 'also', 'here', 'top',
+            'bottom', 'left', 'right', 'side', 'corner', 'area', 'section', 'part'
+        }
+        query_tokens = query_tokens - stop_words
+        # Also filter out very short tokens (likely noise)
+        query_tokens = {t for t in query_tokens if len(t) >= 3}
+        
+        print(f"[DEBUG] Target tokens after filtering: {query_tokens}")
+        
+        if not query_tokens:
+            print("[DEBUG] No target tokens found after filtering")
+            return []
+        
+        exact_matches = []
+        fuzzy_matches = []
+        
+        for c in candidates:
+            text_lower = c["text"].lower().strip()
+            
+            # Exact full-text match (strongest)
+            if text_lower in query_tokens:
+                exact_matches.append(c)
+                continue
+            
+            # Token-in-text match
+            text_tokens = set(re.split(r'[\s\W]+', text_lower))
+            matching_tokens = query_tokens & text_tokens
+            if matching_tokens:
+                exact_matches.append(c)
+                continue
+            
+            # Fuzzy match (Levenshtein distance <= 2) only for longer tokens
+            if c["confidence"] >= 0.6:
+                for qt in query_tokens:
+                    if len(qt) >= 4:  # Only fuzzy match longer tokens
+                        for tt in text_tokens:
+                            if len(tt) >= 4 and self._levenshtein(qt, tt) <= 2:
+                                fuzzy_matches.append(c)
+                                break
+                        else:
+                            continue
+                        break
+        
+        print(f"[DEBUG] Exact matches: {len(exact_matches)}, Fuzzy matches: {len(fuzzy_matches)}")
+        
+        # Prefer exact matches
+        if exact_matches:
+            return exact_matches
+        return fuzzy_matches
+    
+    def _levenshtein(self, s1, s2):
+        """Simple Levenshtein distance"""
+        if len(s1) < len(s2):
+            return self._levenshtein(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        
+        prev_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            curr_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = prev_row[j + 1] + 1
+                deletions = curr_row[j] + 1
+                substitutions = prev_row[j] + (c1 != c2)
+                curr_row.append(min(insertions, deletions, substitutions))
+            prev_row = curr_row
+        return prev_row[-1]
+    
+    def _renderFilteredCandidates(self, candidates, source_image):
+        """Render only filtered/matching OCR candidates for debug"""
+        shapes = []
+        for c in candidates:
+            label = f"{c['ocr_id']}:{c['text'][:12]}"
+            shapes.append(OverlayShape("RECT", c["left"], c["top"], c["width"], c["height"], "lime", label, step=1))
+        self._renderOverlayShapes(shapes, source_image)
+
+    def _extractOcrCandidates(self, image):
+        """Run OCR and build candidate list"""
+        try:
+            import pytesseract
+        except Exception:
+            self.message_area.append("""
+            <div style="background: rgba(255, 100, 100, 0.2); 
+                        border: 1px solid rgba(255, 150, 150, 0.4); 
+                        border-radius: 16px; 
+                        padding: 12px 16px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 200, 200, 0.95);">
+                <b>OCR Error:</b> pytesseract not available.
+            </div>
+            """)
+            self.scrollToBottom()
+            return []
+
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+        candidates = []
+        ocr_id = 1
+        n = len(data.get("text", []))
+        for i in range(n):
+            text = data["text"][i].strip()
+            if not text:
+                continue
+            conf_raw = data.get("conf", [0])[i]
+            try:
+                conf_val = float(conf_raw)
+            except Exception:
+                conf_val = -1.0
+            conf = max(0.0, min(1.0, conf_val / 100.0)) if conf_val >= 0 else 0.0
+            left = int(data["left"][i])
+            top = int(data["top"][i])
+            width = int(data["width"][i])
+            height = int(data["height"][i])
+            candidates.append({
+                "ocr_id": ocr_id,
+                "text": text,
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height,
+                "confidence": conf
+            })
+            ocr_id += 1
+        return candidates
+
+    def _requestOcrSelection(self, message, candidates, image):
+        """Ask LLM to select an OCR candidate by id"""
+        import json
+        prompt = (
+            "You must choose an OCR candidate only from the list below. "
+            "Return JSON only and follow the schema exactly. "
+            "Do NOT invent coordinates or extra fields.\n\n"
+            f"User request: \"{message}\"\n\n"
+            "Return JSON schema:\n"
+            "{\n"
+            "  \"selection\": {\"ocr_id\": 123, \"padding\": 5, \"confidence\": 0.93} | null,\n"
+            "  \"candidates\": [ ... ]\n"
+            "}\n\n"
+            "Rules:\n"
+            "- selection must be null if confidence < 0.6\n"
+            "- If ambiguous, return selection null and include up to 5 candidates.\n"
+            "- Only use ocr_id from candidates.\n\n"
+            f"Candidates:\n{json.dumps(candidates)}"
+        )
+
+        self.gemini_worker = GeminiWorker(message, self.api_key, image_data=image, system_prompt=prompt)
+        self.gemini_worker.response_received.connect(self.onOcrSelectionResponse)
+        self.gemini_worker.error_occurred.connect(self.onAIError)
+        self.gemini_worker.retry_attempt.connect(self.onRetryAttempt)
+        self.gemini_worker.finished.connect(self.onWorkerFinished)
+        self.gemini_worker.start()
+
+    def _renderAllCandidates(self, candidates, source_image):
+        """Render all OCR candidates for debug"""
+        shapes = []
+        for c in candidates:
+            label = f"{c['ocr_id']}:{c['text'][:12]}"
+            shapes.append(OverlayShape("RECT", c["left"], c["top"], c["width"], c["height"], "cyan", label, step=1))
+        self._renderOverlayShapes(shapes, source_image)
+
+    def _renderOverlayShapes(self, shapes, source_image):
+        """Scale and draw shapes based on screenshot size"""
+        print(f"[DEBUG] _renderOverlayShapes: {len(shapes)} shapes")
+        screen_geom = QGuiApplication.primaryScreen().virtualGeometry()
+        sw, sh = screen_geom.width(), screen_geom.height()
+        sx = 1.0
+        sy = 1.0
+        if source_image:
+            try:
+                img_w, img_h = source_image.size
+                print(f"[DEBUG] Source image: {img_w}x{img_h}, Screen: {sw}x{sh}")
+                if img_w > 0 and img_h > 0:
+                    sx = sw / float(img_w)
+                    sy = sh / float(img_h)
+                    print(f"[DEBUG] Scale factors: sx={sx:.3f}, sy={sy:.3f}")
+            except Exception:
+                sx = 1.0
+                sy = 1.0
+        scaled = []
+        for shape in shapes:
+            rect = shape.rect
+            x = int(rect.x() * sx)
+            y = int(rect.y() * sy)
+            w = int(rect.width() * sx)
+            h = int(rect.height() * sy)
+            x = max(0, min(x, sw - 10))
+            y = max(0, min(y, sh - 10))
+            w = min(w, sw - x)
+            h = min(h, sh - y)
+            print(f"[DEBUG] Scaled shape: ({x}, {y}) {w}x{h}")
+            scaled.append(OverlayShape(shape.type, x, y, w, h, shape.color_name, shape.label, shape.step))
+        print(f"[DEBUG] Loading {len(scaled)} shapes into overlay")
+        self.overlay.loadShapes(scaled)
+        self.overlay.setEditMode(False)
+
+    def _drawOverlayFromCandidate(self, candidate, padding, source_image):
+        """Draw overlay from OCR candidate"""
+        print(f"[DEBUG] _drawOverlayFromCandidate: {candidate}")
+        pad = max(0, int(padding))
+        left = candidate["left"] - pad
+        top = candidate["top"] - pad
+        width = candidate["width"] + (pad * 2)
+        height = candidate["height"] + (pad * 2)
+        print(f"[DEBUG] Drawing rect at ({left}, {top}) size ({width}x{height})")
+        shape = OverlayShape("RECT", left, top, width, height, "red", "target", step=1)
+        self._renderOverlayShapes([shape], source_image)
+
+    def _captureOverlayScreenshot(self):
+        """Capture a fresh screenshot for overlay accuracy"""
+        try:
+            was_expanded = self.is_expanded
+            window_pos = self.pos()
+            overlay_visible = self.overlay.isVisible()
+
+            # Hide UI to avoid covering target
+            self.hide()
+            self.overlay.hide()
+            QApplication.processEvents()
+
+            screenshot = ImageGrab.grab()
+
+            # Restore UI
+            self.show()
+            if overlay_visible:
+                self.overlay.show()
+            if was_expanded:
+                self.expandToChat()
+                self.move(window_pos)
+            return screenshot
+        except Exception:
+            # Fall back to latest screenshot if capture fails
+            return self.latest_screenshot
     
     def captureScreenshot(self):
         """Capture full screen screenshot and send to AI for analysis"""
@@ -1704,6 +2651,24 @@ class CircularWindow(QWidget):
         self.input_field.setText("Analyze this screen.")
         self.sendMessage()
 
+    def toggleOverlayEditMode(self):
+        """Toggle manual edit mode for overlays"""
+        if not hasattr(self, 'overlay'):
+            return
+        new_state = not self.overlay.edit_mode
+        self.overlay.setEditMode(new_state)
+        status_msg = """
+        <div style="background: rgba(255, 255, 255, 0.1); 
+                    border-radius: 12px; 
+                    padding: 8px 12px; 
+                    margin: 5px 0;
+                    color: rgba(255, 255, 255, 0.8);">
+            🛠️ Overlay edit mode: <b>{}</b> (drag to move, mouse wheel to resize)
+        </div>
+        """.format("ON" if new_state else "OFF")
+        self.message_area.append(status_msg)
+        self.scrollToBottom()
+
         
     def triggerQuickAction(self, prompt):
         """Execute a quick action via Gemini"""
@@ -1735,27 +2700,103 @@ class CircularWindow(QWidget):
             self.latest_screenshot = screenshot
             self.last_capture_time = datetime.now()
             
+            # GUIDED MODE: Check if user completed the current step
+            if self.follow_manager.guided_mode and self.follow_manager.waiting_for_completion:
+                step_completed = self.follow_manager.checkStepCompletion(current_hash)
+                if step_completed:
+                    # User completed the step! Advance and request next step
+                    self.follow_manager.advanceStep()
+                    self.overlay.closeOverlay()  # Clear current overlay
+                    
+                    # Auto-request next step from AI
+                    print(f"[GuidedNav] Auto-requesting step {self.follow_manager.current_step}")
+                    self._requestNextGuidedStep()
+                    return  # Skip regular analysis during guided mode
+            
             # Follow-Along Logic: Check for screen changes
             if self.follow_manager.active:
-                # Re-use hash logic if possible or keep manager logic separate
                 changed = self.follow_manager.checkScreenChange(screenshot)
                 if changed and self.overlay.isVisible():
                      pass
             
             # Start analysis if not already running and key is set
-            # OPTIMIZATION: Only analyze if screen CHANGED or we haven't analyzed in a while
+            # Skip background analysis during active guided navigation
+            if self.follow_manager.guided_mode and self.follow_manager.waiting_for_completion:
+                return  # Don't do background analysis during guided steps
+            
+            # OPTIMIZATION: Only analyze if screen CHANGED
             if not self.is_analyzing and self.api_key:
-                if not is_screen_same: # Only if changed
-                    # Regular background analysis
+                if not is_screen_same:
                     self.is_analyzing = True
-                    self.context_panel.setStatus("ANALYZING") # Update UI
+                    self.context_panel.setStatus("ANALYZING")
                     self.analysis_worker = AnalysisWorker(screenshot, self.api_key)
                     self.analysis_worker.finished.connect(self.onAnalysisFinished)
                     self.analysis_worker.start()
             
         except Exception as e:
-            self.is_analyzing = False # Reset on error
+            self.is_analyzing = False
             self.context_panel.setStatus("IDLE")
+    
+    def _requestNextGuidedStep(self):
+        """Request the next step in guided navigation from AI"""
+        if not self.follow_manager.guided_mode:
+            return
+        
+        task_goal = self.follow_manager.current_task
+        step_num = self.follow_manager.current_step
+        
+        # Show loading indicator
+        loading_msg = f"""
+        <div style="margin: 8px 0; color: rgba(80, 200, 255, 0.8); font-style: italic;">
+            📍 Step {step_num}: Analyzing screen...
+        </div>
+        """
+        self.message_area.append(loading_msg)
+        self.scrollToBottom()
+        
+        # Disable input while processing
+        self.input_field.setEnabled(False)
+        self.send_button.setEnabled(False)
+        
+        # Get screen resolution
+        screen_geom = QGuiApplication.primaryScreen().virtualGeometry()
+        res_info = f"Screen Resolution: {screen_geom.width()}x{screen_geom.height()}"
+        
+        system_prompt = f"""You are a step-by-step screen guidance assistant.
+
+USER GOAL: "{task_goal}"
+CURRENT STEP NUMBER: {step_num}
+{res_info}
+
+Look at the screenshot and find the EXACT UI element the user needs to click.
+Estimate the pixel coordinates of that element.
+
+RESPONSE FORMAT (REQUIRED):
+ACTION: [what to click]
+SHAPE[type:box, x:950, y:330, w:50, h:24, color:green, label:"Click here", step:1]
+
+THE SHAPE LINE ABOVE IS AN EXAMPLE. Replace the numbers with:
+- x = pixels from LEFT edge (e.g., 950)
+- y = pixels from TOP edge (e.g., 330)
+- w = width in pixels (e.g., 50)
+- h = height in pixels (e.g., 24)
+
+RULES:
+- Provide only ONE step at a time
+- x, y, w, h must be NUMBERS, not words
+- If task is DONE respond: TASK_COMPLETE
+
+Continue from step {step_num}."""
+        
+        # Use latest screenshot
+        current_image = self.latest_screenshot
+        
+        self.gemini_worker = GeminiWorker("Continue to next step", self.api_key, image_data=current_image, system_prompt=system_prompt)
+        self.gemini_worker.response_received.connect(self.onAIResponse)
+        self.gemini_worker.error_occurred.connect(self.onAIError)
+        self.gemini_worker.retry_attempt.connect(self.onRetryAttempt)
+        self.gemini_worker.finished.connect(self.onWorkerFinished)
+        self.gemini_worker.start()
     
     def showAPIKeyDialog(self):
         """Show API key dialog and store the key"""
@@ -2036,6 +3077,11 @@ if __name__ == '__main__':
     # Enable high DPI support
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    # Manual test note (OCR overlay):
+    # 1) Open an app with multiple instances of the word "Terminal".
+    # 2) Run: "make rectangle on Terminal"
+    # 3) Verify the smallest OCR box containing "Terminal" is selected.
     
     app = QApplication(sys.argv)
     
