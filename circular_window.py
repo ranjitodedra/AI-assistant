@@ -4,8 +4,9 @@ import tempfile
 import io
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QTextEdit, QLineEdit, QPushButton, QLabel, QScrollArea, QDialog, QSizeGrip)
-from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QRect, QSize, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty
+                             QTextEdit, QLineEdit, QPushButton, QLabel, QScrollArea, QDialog, QSizeGrip, QMenu)
+from PyQt5.QtGui import QCursor
+from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QRect, QSize, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty, QObject
 from PyQt5.QtGui import (QPainter, QBrush, QColor, QFont, QLinearGradient, 
                         QPen, QPainterPath, QFontMetrics, QGradient)
 from PyQt5.QtWidgets import QGraphicsDropShadowEffect, QGraphicsBlurEffect
@@ -121,6 +122,10 @@ class IconButton(QPushButton):
             path.lineTo(half_size, size - 2)
             path.moveTo(2, half_size)
             path.lineTo(size - 2, half_size)
+        elif icon_type == "eye":
+            # Eye icon for monitoring toggle
+            path.addEllipse(2, half_size - 4, size - 4, 8)  # Eye outline
+            path.addEllipse(half_size - 3, half_size - 3, 6, 6)  # Pupil
         
         return path
 
@@ -219,11 +224,13 @@ class GeminiWorker(QThread):
     error_occurred = pyqtSignal(str)
     retry_attempt = pyqtSignal(int, float)  # Emits attempt number and wait time
     
-    def __init__(self, message, api_key, image_path=None):
+    def __init__(self, message, api_key, image_path=None, image_data=None, system_prompt=None):
         super().__init__()
         self.message = message
         self.api_key = api_key
-        self.image_path = image_path  # Optional image for multimodal requests
+        self.image_path = image_path  # Optional image file path
+        self.image_data = image_data  # Optional PIL Image object (direct buffer)
+        self.system_prompt = system_prompt # Optional system prompt override
     
     def _is_service_unavailable(self, exception):
         """Check if exception is a 503 Service Unavailable error"""
@@ -239,19 +246,33 @@ class GeminiWorker(QThread):
     
     def _make_api_call(self):
         """Make the API call with retry logic"""
-        if not self.api_key:
-            raise ValueError("API key not found. Please configure it in settings.")
+        if not self.api_key or not isinstance(self.api_key, str) or len(self.api_key.strip()) < 10:
+            raise ValueError("API key not found or invalid. Please configure it in settings.")
+        
+        # Flush stdout before API call to prevent buffer pollution
+        sys.stdout.flush()
+        sys.stderr.flush()
         
         # Initialize client with API key
-        client = genai.Client(api_key=self.api_key)
+        client = genai.Client(api_key=self.api_key.strip())
         
-        # Prepare contents - text only or multimodal (text + image)
+        # Prepare contents
+        contents = []
+        
+        # Add system prompt if provided (prepended to message)
+        final_message = self.message
+        if self.system_prompt:
+            final_message = self.system_prompt.format(user_message=self.message)
+            
+        contents.append(final_message)
+        
+        # Add image from path
         if self.image_path and os.path.exists(self.image_path):
-            # Load image for multimodal request
             image = Image.open(self.image_path)
-            contents = [self.message, image]
-        else:
-            contents = self.message
+            contents.append(image)
+        # Add image from buffer (PIL object)
+        elif self.image_data:
+            contents.append(self.image_data)
         
         # Make API call with retry decorator
         @retry(
@@ -295,6 +316,504 @@ class GeminiWorker(QThread):
                 self.error_occurred.emit(f"Error: {error_msg}")
 
 
+class AnalysisWorker(QThread):
+    """Worker thread for silent background screen analysis"""
+    finished = pyqtSignal(str)
+    
+    def __init__(self, image, api_key):
+        super().__init__()
+        self.image = image
+        self.api_key = api_key
+        
+    def run(self):
+        # Guard: API key must be a non-empty string
+        if not self.api_key or not isinstance(self.api_key, str) or len(self.api_key.strip()) < 10:
+            self.finished.emit("Analysis skipped: Invalid API key")
+            return
+            
+        try:
+            # Flush stdout before API call to prevent buffer pollution
+            sys.stdout.flush()
+            sys.stderr.flush()
+            
+            client = genai.Client(api_key=self.api_key.strip())
+            prompt = "Analyze this screen. What application is this? What is the user trying to do? List key UI elements (buttons, menus, input fields) with their approximate screen positions."
+            
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[prompt, self.image]
+            )
+            self.finished.emit(response.text)
+        except Exception as e:
+            # Log error but don't pollute stdout
+            self.finished.emit(f"Analysis failed: {str(e)}")
+
+
+class OverlayShape:
+    """Data class for shapes drawn on the overlay"""
+    def __init__(self, shape_type, x, y, width, height, color="red", label=None, step=1):
+        self.type = shape_type  # "CIRCLE", "RECT", "ARROW"
+        self.rect = QRect(int(x), int(y), int(width), int(height))
+        self.color_name = color
+        self.label = label
+        self.step = int(step)
+        self.start_time = datetime.now()
+        self.opacity = 0.0
+        self.max_opacity = 0.9
+        self.duration = 20.0  # Longer duration for steps
+        self.is_expired = False
+
+class OverlayWindow(QWidget):
+    """Transparent full-screen overlay for drawing guidance shapes"""
+    def __init__(self):
+        super().__init__()
+        # Transparent, click-through, always on top
+        self.setWindowFlags(
+            Qt.WindowStaysOnTopHint |
+            Qt.FramelessWindowHint |
+            Qt.Tool |
+            Qt.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        
+        # Full screen geometry
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(0, 0, screen.width(), screen.height())
+        
+        self.shapes = []
+        self._pulse_time = 0.0
+        
+        # Step management
+        self.all_shapes = []
+        self.current_step = 1
+        self.total_steps = 0
+        
+        # Animation timer (30 FPS)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.updateAnimations)
+        self.timer.start(33)
+        
+    def loadShapes(self, shapes):
+        """Load a sequence of shapes"""
+        self.all_shapes = shapes
+        if shapes:
+            self.total_steps = max((s.step for s in shapes), default=1)
+            self.current_step = 1
+            self.updateActiveShapes()
+            self.show()
+        else:
+            self.hide()
+            
+    def updateActiveShapes(self):
+        """Show shapes for current step"""
+        now = datetime.now()
+        self.shapes = [s for s in self.all_shapes if s.step == self.current_step]
+        # Reset start time for fresh fade-in
+        for s in self.shapes:
+            s.start_time = now
+            s.opacity = 0.0
+        self.update()
+        
+    def nextStep(self):
+        """Advance to next step or close if finished"""
+        if self.current_step < self.total_steps:
+            self.current_step += 1
+            self.updateActiveShapes()
+        else:
+            self.closeOverlay()
+            
+    def closeOverlay(self):
+        self.shapes = []
+        self.all_shapes = []
+        self.hide()
+        
+    def addShape(self, shape_type, x, y, w, h, color, label=None, step=1):
+        # Legacy/direct add capability
+        shape = OverlayShape(shape_type, x, y, w, h, color, label, step)
+        self.shapes.append(shape)
+        self.update()
+        
+    def clearLayout(self):
+        self.shapes = []
+        self.all_shapes = []
+        self.update()
+        
+    def updateAnimations(self):
+        now = datetime.now()
+        active_shapes = []
+        has_updates = False
+        
+        self._pulse_time += 0.1
+        
+        for shape in self.shapes:
+            elapsed = (now - shape.start_time).total_seconds()
+            
+            # Fade in logic (first 0.3s)
+            if elapsed < 0.3:
+                shape.opacity = (elapsed / 0.3) * shape.max_opacity
+                has_updates = True
+            # Fade out logic (last 1s)
+            elif elapsed > shape.duration - 1.0:
+                remaining = shape.duration - elapsed
+                shape.opacity = max(0.0, (remaining / 1.0) * shape.max_opacity)
+                has_updates = True
+            
+            if elapsed < shape.duration:
+                active_shapes.append(shape)
+            else:
+                has_updates = True # Shape expired (removed)
+        
+        self.shapes = active_shapes
+        if has_updates or self.shapes: # Keep updating if shapes exist (for pulse)
+            self.update()
+            
+    def paintEvent(self, event):
+        if not self.shapes:
+            return
+            
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        import math
+        # Pulse scale factor (0.95 to 1.05)
+        pulse_scale = 1.0 + (math.sin(self._pulse_time) * 0.05)
+        
+        for shape in self.shapes:
+            # Determine color
+            c = QColor(shape.color_name)
+            if not c.isValid(): c = QColor("red")
+            
+            # Set opacity
+            c.setAlphaF(shape.opacity)
+            pen = QPen(c, 3)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            
+            # Fill with low opacity
+            fill_c = QColor(c)
+            fill_c.setAlphaF(shape.opacity * 0.2)
+            painter.setBrush(QBrush(fill_c))
+            
+            # Pulse the size - convert to int for QPainter
+            center = shape.rect.center()
+            w = int(shape.rect.width() * pulse_scale)
+            h = int(shape.rect.height() * pulse_scale)
+            x = int(center.x() - w / 2)
+            y = int(center.y() - h / 2)
+            
+            if shape.type == "CIRCLE":
+                painter.drawEllipse(x, y, w, h)
+            elif shape.type == "RECT":
+                painter.drawRoundedRect(x, y, w, h, 8, 8)
+            elif shape.type == "ARROW":
+                # Draw arrow pointing at center
+                # Simple implementation: Triangle pointer
+                path = QPainterPath()
+                # Assuming rect defines the target area, adjust pointer
+                # Points to bottom-right of the rect for 'pointing' effect or center
+                # Let's draw an arrow pointing TO the target from bottom-right (cursor style)
+                cursor_size = 24 * pulse_scale
+                tip = center
+                path.moveTo(tip)
+                path.lineTo(tip.x() + cursor_size, tip.y() + cursor_size * 0.5)
+                path.lineTo(tip.x() + cursor_size * 0.5, tip.y() + cursor_size)
+                path.closeSubpath()
+                painter.drawPath(path)
+            
+            # Draw Label
+            if shape.label and shape.opacity > 0.4:
+                painter.setPen(QColor(255, 255, 255, int(shape.opacity * 255)))
+                painter.setBrush(QColor(0, 0, 0, int(shape.opacity * 180)))
+                font = painter.font()
+                font.setBold(True)
+                font.setPointSize(12)
+                painter.setFont(font)
+                
+                fm = QFontMetrics(font)
+                text_rect = fm.boundingRect(shape.label)
+                text_rect.adjust(-10, -5, 10, 5) # Padding
+                text_rect.moveCenter(QPoint(int(center.x()), int(y - 25))) # Place above
+                
+                painter.drawRoundedRect(text_rect, 5, 5)
+                painter.drawText(text_rect, Qt.AlignCenter, shape.label)
+
+
+class FollowAlongManager:
+    """Manages continuous guidance state and verification"""
+    def __init__(self, parent):
+        self.parent = parent
+        self.active = False
+        self.last_screen_hash = None
+        self.same_screen_count = 0
+        self.tts_engine = None
+        
+        # Initialize TTS
+        try:
+            import pyttsx3
+            self.tts_engine = pyttsx3.init()
+            # Set properties (speed, volume)
+            self.tts_engine.setProperty('rate', 170)
+            self.tts_engine.setProperty('volume', 0.8)
+        except ImportError:
+            print("pyttsx3 not found. Audio disabled.")
+        except Exception as e:
+            print(f"TTS Init failed: {e}")
+
+    def start(self):
+        self.active = True
+        self.last_screen_hash = None
+        self.speak("Follow-along mode activated.")
+
+    def stop(self):
+        self.active = False
+        self.speak("Guidance stopped.")
+
+    def speak(self, text):
+        """Speak text using TTS engine"""
+        if self.tts_engine:
+            try:
+                # Run in separate thread to avoid blocking UI
+                import threading
+                def _speak():
+                    self.tts_engine.say(text)
+                    self.tts_engine.runAndWait()
+                threading.Thread(target=_speak, daemon=True).start()
+            except Exception as e:
+                print(f"TTS Error: {e}")
+    
+    def checkScreenChange(self, current_image):
+        """Check if screen changed significantly"""
+        if not self.active or not current_image:
+            return False
+            
+        try:
+            # Convert to grayscale and resize for fast comparison
+            # Using hash or raw bytes
+            from PIL import ImageOps
+            
+            # Simple hash check
+            # Resize to small thumbnail to ignore minor noise
+            thumb = current_image.resize((64, 64), Image.Resampling.LANCZOS)
+            gray = ImageOps.grayscale(thumb)
+            current_hash = hash(gray.tobytes())
+            
+            is_changed = False
+            if self.last_screen_hash is not None:
+                # If hash differs (basic check, can be improved with ImageChops)
+                if current_hash != self.last_screen_hash:
+                    is_changed = True
+            
+            self.last_screen_hash = current_hash
+            return is_changed
+        except Exception as e:
+            print(f"Diff check failed: {e}")
+            return False
+
+class ContextPanel(QWidget):
+    """Panel to display real-time AI context analysis"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(140)
+        self.setStyleSheet("""
+            QWidget {
+                background: rgba(0, 0, 0, 0.3);
+                border-radius: 12px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 12, 15, 12)
+        layout.setSpacing(6)
+        
+        # Header
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.header_label = QLabel("✨ AI Context Logic")
+        self.header_label.setStyleSheet("color: rgba(80, 200, 255, 0.8); font-size: 11px; font-weight: bold; border: none; background: transparent;")
+        header_layout.addWidget(self.header_label)
+        
+        
+        # Action Buttons
+        ctx_actions = QHBoxLayout()
+        ctx_actions.setSpacing(8)
+        
+        # Calibrate Button
+        self.calibrate_btn = QPushButton("Calibrate")
+        self.calibrate_btn.setFixedSize(70, 20)
+        self.calibrate_btn.setCursor(Qt.PointingHandCursor)
+        self.calibrate_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 0.1);
+                color: rgba(255, 255, 255, 0.7);
+                border-radius: 4px;
+                font-size: 10px;
+                border: none;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.2);
+                color: white;
+            }
+        """)
+        ctx_actions.addWidget(self.calibrate_btn)
+        
+        
+        # Follow Along Toggle
+        self.follow_btn = QPushButton("Follow Mode: OFF")
+        self.follow_btn.setFixedSize(90, 20)
+        self.follow_btn.setCursor(Qt.PointingHandCursor)
+        self.follow_btn.setCheckable(True)
+        self.follow_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 0.1);
+                color: rgba(255, 255, 255, 0.7);
+                border-radius: 4px;
+                font-size: 10px;
+                border: none;
+            }
+            QPushButton:checked {
+                background: rgba(80, 200, 255, 0.3);
+                color: white;
+                border: 1px solid rgba(80, 200, 255, 0.5);
+            }
+        """)
+        ctx_actions.addWidget(self.follow_btn)
+        
+        layout.addLayout(header_layout)
+        layout.addLayout(ctx_actions)
+        
+        # App Name
+        self.app_label = QLabel("Waiting for analysis...")
+        self.app_label.setStyleSheet("color: white; font-weight: 600; font-size: 13px; border: none; background: transparent;")
+        layout.addWidget(self.app_label)
+        
+        # Details (scrollable info)
+        self.details_label = QLabel("Screen monitoring active. Analyzing content...")
+        self.details_label.setWordWrap(True)
+        self.details_label.setStyleSheet("color: rgba(255,255,255,0.7); font-size: 11px; border: none; background: transparent;")
+        self.details_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        
+        # Use a scroll area for details
+        scroll = QScrollArea()
+        scroll.setWidget(self.details_label)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { width: 4px; background: transparent; }
+            QScrollBar::handle:vertical { background: rgba(255,255,255,0.2); border-radius: 2px; }
+        """)
+        layout.addWidget(scroll)
+    
+    def setStatus(self, status):
+        """Update status label"""
+        if status == "ANALYZING":
+            self.app_label.setText("Analyzing...")
+            self.app_label.setStyleSheet("color: #80c0ff; font-weight: 600; font-size: 13px; border: none; background: transparent;")
+        elif status == "IDLE":
+            self.app_label.setStyleSheet("color: white; font-weight: 600; font-size: 13px; border: none; background: transparent;")
+    
+    def updateContext(self, analysis_text):
+        """Update the panel with new analysis data"""
+        lines = analysis_text.strip().split('\n')
+        summary = lines[0] if lines else "Unknown App"
+        if len(summary) > 40: 
+            summary = summary[:40] + "..."
+        self.app_label.setText(summary)
+        clean_text = analysis_text.replace('**', '').replace('##', '')
+        self.details_label.setText(clean_text)
+            
+    def showActionsMenu(self):
+        """Show Quick Actions Menu"""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: rgb(40, 45, 60);
+                color: white;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: rgba(80, 200, 255, 0.2);
+            }
+        """)
+        
+        act_guide = menu.addAction("🧭 Guide me through this app")
+        act_what = menu.addAction("💡 What can I do here?")
+        act_find = menu.addAction("🔍 Find a feature...")
+        
+        action = menu.exec_(QCursor.pos())
+        
+        # Determine parent to call
+        # Since this is a widget inside layout, traverse up or pass parent reference
+        # We know parent is CircularWindow or layout container
+        # Best to emit signal or use parent() if reliable
+        window = self.window() # Get top level window
+        if hasattr(window, 'triggerQuickAction'):
+            if action == act_guide:
+                window.triggerQuickAction("Guide me through the main workflow of this application.")
+            elif action == act_what:
+                window.triggerQuickAction("What are the main actionable elements on this screen and what do they do?")
+            elif action == act_find:
+                # Prompt user for feature name
+                from PyQt5.QtWidgets import QInputDialog
+                text, ok = QInputDialog.getText(self, "Find Feature", "What are you looking for?")
+                if ok and text:
+                    window.triggerQuickAction(f"Where is the '{text}' feature located? Provide steps.")
+
+class GlobalHotkeyManager(QObject):
+    """Manages system-wide keyboard shortcuts"""
+    # Signals for main thread actions
+    sig_toggle_overlay = pyqtSignal()
+    sig_ask_ai = pyqtSignal()
+    sig_next_step = pyqtSignal()
+    sig_clear_overlay = pyqtSignal()
+    sig_toggle_monitoring = pyqtSignal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.listening = False
+        
+    def start(self):
+        try:
+            import keyboard
+            
+            # Remove all previous hotkeys to be safe
+            keyboard.unhook_all()
+            
+            # Register Hotkeys
+            # Ctrl+Shift+G: Toggle Overlay
+            keyboard.add_hotkey('ctrl+shift+g', self.sig_toggle_overlay.emit)
+            # Ctrl+Shift+A: Ask AI about screen
+            keyboard.add_hotkey('ctrl+shift+a', self.sig_ask_ai.emit)
+            # Ctrl+Shift+N: Next Step
+            keyboard.add_hotkey('ctrl+shift+n', self.sig_next_step.emit)
+            # Ctrl+Shift+C: Clear Overlays
+            keyboard.add_hotkey('ctrl+shift+c', self.sig_clear_overlay.emit)
+            # Ctrl+Shift+M: Toggle Monitoring
+            keyboard.add_hotkey('ctrl+shift+m', self.sig_toggle_monitoring.emit)
+            
+            self.listening = True
+            print("Global hotkeys registered.")
+        except ImportError:
+            print("Error: 'keyboard' library not found. Hotkeys disabled. Run 'pip install keyboard'")
+        except Exception as e:
+            print(f"Hotkey Error: {e}")
+            
+    def stop(self):
+        if self.listening:
+            try:
+                import keyboard
+                keyboard.unhook_all()
+            except: pass
+
+
 class CircularWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -310,6 +829,30 @@ class CircularWindow(QWidget):
         
         # API key stored in memory (session only)
         self.api_key = None
+        
+        # Screen monitoring state
+        self.screen_monitoring_enabled = False
+        self.latest_screenshot = None
+        self.last_capture_time = None
+        self.is_analyzing = False  # Flag to prevent overlapping analysis calls
+        
+        
+        # Follow-Along Manager
+        self.follow_manager = FollowAlongManager(self)
+        
+        # Hotkey Manager
+        self.hotkey_manager = GlobalHotkeyManager(self)
+        self.hotkey_manager.sig_toggle_overlay.connect(self.toggleOverlayVisibility)
+        self.hotkey_manager.sig_ask_ai.connect(self.triggerAskAI)
+        self.hotkey_manager.sig_next_step.connect(self.triggerNextStep)
+        self.hotkey_manager.sig_clear_overlay.connect(self.triggerClearOverlay)
+        self.hotkey_manager.sig_toggle_monitoring.connect(self.toggleScreenMonitoring)
+        # Delay start to avoid constructor issues
+        QTimer.singleShot(1000, self.hotkey_manager.start)
+        
+        # Screen monitor timer (3 second interval)
+        self.screen_monitor_timer = QTimer(self)
+        self.screen_monitor_timer.timeout.connect(self._autoCapture)
         
         # Robot face animation state
         self._pulse_value = 0.0  # For glow pulse animation
@@ -331,13 +874,20 @@ class CircularWindow(QWidget):
         self.robot_primary = QColor(100, 180, 255)  # Soft blue for eyes
         self.robot_glow = QColor(120, 200, 255, 80)  # Glow effect
         
+        # Calibration mode state
+        self.calibration_mode = False
+        
         self.initUI()
         
         # Show API key dialog on startup if no key is set
         if not self.api_key:
             self.showAPIKeyDialog()
-    
+            
     def initUI(self):
+        # Initialize Overlay Window
+        self.overlay = OverlayWindow()
+        self.overlay.show()
+        
         # Set initial window size (bubble state)
         self.setFixedSize(40, 40)
         
@@ -368,6 +918,20 @@ class CircularWindow(QWidget):
         y = (screen.height() - self.height()) // 2
         self.move(x, y)
     
+    def startCalibration(self):
+        """Start the interactive calibration process"""
+        self.setCalibrationMode(True)
+
+    def addShape(self, *args, **kwargs):
+        """Forward shape drawing to overlay"""
+        if hasattr(self, 'overlay'):
+            self.overlay.addShape(*args, **kwargs)
+
+    def clearLayout(self):
+        """Forward clear command to overlay"""
+        if hasattr(self, 'overlay'):
+            self.overlay.clearLayout()
+
     def setupChatUI(self):
         """Setup integrated capsule input UI"""
         # Main layout
@@ -464,6 +1028,13 @@ class CircularWindow(QWidget):
         self.screenshot_button.clicked.connect(self.captureScreenshot)
         capsule_layout.addWidget(self.screenshot_button)
         
+        # Screen monitoring toggle button
+        self.monitor_toggle = IconButton("eye", self.capsule)
+        self.monitor_toggle.setFixedSize(36, 36)
+        self.monitor_toggle.setStyleSheet("background: transparent; border-radius: 18px;")
+        self.monitor_toggle.clicked.connect(self.toggleScreenMonitoring)
+        capsule_layout.addWidget(self.monitor_toggle)
+        
         self.send_button = GradientSendButton(self.capsule)
         self.send_button.setFixedSize(36, 36)
         self.send_button.clicked.connect(self.sendMessage)
@@ -477,9 +1048,21 @@ class CircularWindow(QWidget):
             }
         """)
         capsule_layout.addWidget(self.send_button)
+        capsule_layout.addWidget(self.send_button)
         
         container_layout.addWidget(self.capsule)
         self.main_layout.addWidget(self.input_container)
+        
+        # Add Context Panel (Hidden by default, shown when monitoring is active)
+        self.context_panel = ContextPanel()
+        self.context_panel.hide()
+        # Connect calibration button
+        self.context_panel.calibrate_btn.clicked.connect(self.startCalibration)
+        # Connect follow button
+        self.context_panel.follow_btn.toggled.connect(self.toggleFollowMode)
+        self.main_layout.addWidget(self.context_panel)
+        # Add some margin at bottom
+        self.main_layout.addSpacing(10)
         
         # Add Resising Grip
         self.size_grip = QSizeGrip(self)
@@ -682,8 +1265,33 @@ class CircularWindow(QWidget):
             self.send_button.setEnabled(True)
             return
         
-        # Create and start worker thread
-        self.gemini_worker = GeminiWorker(message, self.api_key)
+        # Create and start worker thread logic...
+        
+        # Determine context and prompts
+        current_image = None
+        system_prompt = None
+        
+        # Get screen resolution
+        screen_geom = QApplication.primaryScreen().geometry()
+        res_info = f"Screen Resolution: {screen_geom.width()}x{screen_geom.height()}"
+        
+        # Use monitored screenshot if available to provide context
+        if self.latest_screenshot:
+            current_image = self.latest_screenshot
+            system_prompt = f"""
+            You are a screen guidance assistant. User asked: "{{user_message}}"
+            Based on the screenshot, provide step-by-step instructions.
+            {res_info}: Coordinates must be absolute pixels relative to top-left (0,0).
+            
+            CRITICAL: Visually mark UI elements using SHAPE commands.
+            Format: SHAPE[type:box|arrow|circle, x:int, y:int, w:int, h:int, color:str, label:"str", step:int]
+            
+            Example:
+            1. Click File. SHAPE[type:box, x:10, y:20, w:50, h:20, color:red, label:"Click File", step:1]
+            2. Select Open. SHAPE[type:box, x:10, y:100, w:100, h:30, color:blue, label:"Select Open", step:2]
+            """
+        
+        self.gemini_worker = GeminiWorker(message, self.api_key, image_data=current_image, system_prompt=system_prompt)
         self.gemini_worker.response_received.connect(self.onAIResponse)
         self.gemini_worker.error_occurred.connect(self.onAIError)
         self.gemini_worker.retry_attempt.connect(self.onRetryAttempt)
@@ -698,11 +1306,84 @@ class CircularWindow(QWidget):
         cursor.select(cursor.BlockUnderCursor)
         cursor.removeSelectedText()
         
+        # Parse SHAPE commands (regex extraction)
+        import re
+        parsed_shapes = []
+        clean_text_lines = []
+        
+        # Regex to match SHAPE[...] block
+        # Matches SHAPE[ ... ] non-greedily
+        shape_pattern = re.compile(r'SHAPE\[(.*?)\]')
+        
+        lines = response_text.split('\n')
+        for line in lines:
+            matches = shape_pattern.findall(line)
+            if matches:
+                 # Line contains shapes
+                 clean_line = shape_pattern.sub('', line).strip()
+                 if clean_line:
+                     clean_text_lines.append(clean_line)
+                 
+                 for match_str in matches:
+                     try:
+                         # Parse key:value pairs
+                         # type:circle, x:500, label:"Click here"
+                         params = {}
+                         # Split by comma but respect quotes is hard with simple split, 
+                         # simplest approach: split by comma, clean whitespace
+                         # Better: regex for key:value
+                         
+                         parts = match_str.split(',')
+                         for part in parts:
+                             if ':' in part:
+                                 k, v = part.split(':', 1)
+                                 k = k.strip()
+                                 v = v.strip().strip('"\'')
+                                 params[k] = v
+                        
+                         shape = OverlayShape(
+                             shape_type=params.get('type', 'RECT').upper(),
+                             x=int(params.get('x', 0)),
+                             y=int(params.get('y', 0)),
+                             width=int(params.get('w', 100)),
+                             height=int(params.get('h', 100)),
+                             color=params.get('color', 'red'),
+                             label=params.get('label', ''),
+                             step=int(params.get('step', 1))
+                         )
+                         parsed_shapes.append(shape)
+                     except Exception as e:
+                         print(f"Error parsing shape: {e}")
+            else:
+                clean_text_lines.append(line)
+        
+        # Load parsing results into overlay
+        if parsed_shapes:
+            # COORDINATE VALIDATION
+            screen_geom = QApplication.primaryScreen().geometry()
+            sw, sh = screen_geom.width(), screen_geom.height()
+            
+            valid_shapes = []
+            for s in parsed_shapes:
+                # Clamp coordinates to screen bounds to prevent off-screen drawing
+                rect = s.rect
+                nx = max(0, min(rect.x(), sw - 10))
+                ny = max(0, min(rect.y(), sh - 10))
+                nw = min(rect.width(), sw - nx)
+                nh = min(rect.height(), sh - ny)
+                
+                s.rect = QRect(nx, ny, nw, nh)
+                valid_shapes.append(s)
+                
+            self.overlay.loadShapes(valid_shapes)
+        
+        clean_text = '\n'.join(clean_text_lines)
+        
         # Add AI response with minimalist styling
         ai_message = f"""
         <div style="margin: 12px 0; margin-right: 40px;">
             <div style="color: rgba(255, 255, 255, 0.95); line-height: 1.4;">
-                {response_text}
+                {clean_text}
             </div>
         </div>
         """
@@ -919,6 +1600,163 @@ class CircularWindow(QWidget):
         self.screenshot_button.setEnabled(True)
         self.input_field.setFocus()
     
+    def toggleScreenMonitoring(self):
+        """Toggle continuous screen monitoring on/off"""
+        # Check if API key is set before enabling monitoring
+        if not self.screen_monitoring_enabled:
+            if not self.api_key or not isinstance(self.api_key, str) or len(self.api_key.strip()) < 10:
+                error_msg = """
+                <div style="background: rgba(255, 100, 100, 0.15); 
+                            border: 1px solid rgba(255, 100, 100, 0.3); 
+                            border-radius: 12px; 
+                            padding: 8px 12px; 
+                            margin: 5px 0;
+                            color: rgba(255, 200, 200, 0.9);">
+                    ⚠️ Please set your API key first (via Settings)
+                </div>
+                """
+                self.message_area.append(error_msg)
+                self.scrollToBottom()
+                return
+        
+        self.screen_monitoring_enabled = not self.screen_monitoring_enabled
+        
+        if self.screen_monitoring_enabled:
+            self.screen_monitor_timer.start(3000)  # 3 seconds
+            status_msg = """
+            <div style="background: rgba(80, 200, 255, 0.15); 
+                        border: 1px solid rgba(80, 200, 255, 0.3); 
+                        border-radius: 12px; 
+                        padding: 8px 12px; 
+                        margin: 5px 0;
+                        color: rgba(255, 255, 255, 0.9);">
+                👁️ Screen monitoring: <b>ON</b>
+            </div>
+            """
+            # Update button style to show active state
+            self.monitor_toggle.setStyleSheet("""
+                background: rgba(80, 200, 255, 0.2); 
+                border-radius: 18px;
+                border: 1px solid rgba(80, 200, 255, 0.4);
+            """)
+            self.context_panel.show() # Show context panel
+        else:
+            self.screen_monitor_timer.stop()
+            status_msg = """
+            <div style="background: rgba(255, 255, 255, 0.1); 
+                        border-radius: 12px; 
+                        padding: 8px 12px; 
+                        margin: 5px 0;
+                        color: rgba(255, 255, 255, 0.7);">
+                👁️ Screen monitoring: <b>OFF</b>
+            </div>
+            """
+            # Reset button style
+            self.monitor_toggle.setStyleSheet("background: transparent; border-radius: 18px;")
+            self.context_panel.hide() # Hide context panel
+        
+        self.message_area.append(status_msg)
+        self.scrollToBottom()
+    
+    def onAnalysisFinished(self, result):
+        """Handle completion of background analysis"""
+        self.is_analyzing = False
+        self.context_panel.setStatus("IDLE") # Reset status
+        if self.screen_monitoring_enabled:
+            self.context_panel.updateContext(result)
+    
+    
+    def toggleFollowMode(self, checked):
+        """Toggle follow-along guidance"""
+        if checked:
+            self.follow_manager.start()
+            self.context_panel.follow_btn.setText("Follow Mode: ON")
+            # Ensure monitoring is ON
+            if not self.screen_monitoring_enabled:
+                self.toggleScreenMonitoring()
+        else:
+            self.follow_manager.stop()
+            self.context_panel.follow_btn.setText("Follow Mode: OFF")
+            
+    def toggleOverlayVisibility(self):
+        """Slot for hotkey to toggle overlay"""
+        if self.overlay.isVisible():
+            self.overlay.hide()
+        else:
+            self.overlay.show()
+
+    def triggerNextStep(self):
+        """Slot for hotkey to advance step"""
+        if self.overlay.isVisible():
+            self.overlay.nextStep()
+
+    def triggerClearOverlay(self):
+        """Slot for hotkey to clear guidance"""
+        self.overlay.closeOverlay()
+
+    def triggerAskAI(self):
+        """Slot for hotkey to analyze screen"""
+        # Simulate asking "Analyze this screen"
+        if not self.screen_monitoring_enabled:
+            # Need to capture once if monitoring is off
+            pass 
+        
+        self.input_field.setText("Analyze this screen.")
+        self.sendMessage()
+
+        
+    def triggerQuickAction(self, prompt):
+        """Execute a quick action via Gemini"""
+        self.input_field.setText(prompt)
+        self.sendMessage()
+        
+    def _calculateScreenHash(self, image):
+        """Calculate simple hash for screen diffing"""
+        try:
+            from PIL import ImageOps
+            # Resize for performance and noise tolerance
+            thumb = image.resize((64, 64), Image.Resampling.LANCZOS)
+            gray = ImageOps.grayscale(thumb)
+            return hash(gray.tobytes())
+        except:
+            return 0
+
+    def _autoCapture(self):
+        """Auto-capture screenshot for monitoring (silent, no AI call)"""
+        try:
+            # Capture without hiding window (background capture)
+            screenshot = ImageGrab.grab()
+            
+            # Optimization: Check hash to skip redundant analysis
+            current_hash = self._calculateScreenHash(screenshot)
+            is_screen_same = (current_hash == getattr(self, 'last_screen_hash_val', None))
+            self.last_screen_hash_val = current_hash
+            
+            self.latest_screenshot = screenshot
+            self.last_capture_time = datetime.now()
+            
+            # Follow-Along Logic: Check for screen changes
+            if self.follow_manager.active:
+                # Re-use hash logic if possible or keep manager logic separate
+                changed = self.follow_manager.checkScreenChange(screenshot)
+                if changed and self.overlay.isVisible():
+                     pass
+            
+            # Start analysis if not already running and key is set
+            # OPTIMIZATION: Only analyze if screen CHANGED or we haven't analyzed in a while
+            if not self.is_analyzing and self.api_key:
+                if not is_screen_same: # Only if changed
+                    # Regular background analysis
+                    self.is_analyzing = True
+                    self.context_panel.setStatus("ANALYZING") # Update UI
+                    self.analysis_worker = AnalysisWorker(screenshot, self.api_key)
+                    self.analysis_worker.finished.connect(self.onAnalysisFinished)
+                    self.analysis_worker.start()
+            
+        except Exception as e:
+            self.is_analyzing = False # Reset on error
+            self.context_panel.setStatus("IDLE")
+    
     def showAPIKeyDialog(self):
         """Show API key dialog and store the key"""
         dialog = SettingsDialog(self)
@@ -1121,13 +1959,54 @@ class CircularWindow(QWidget):
         painter.setBrush(Qt.NoBrush)
         painter.drawPath(inner_path)
     
+    def setCalibrationMode(self, enabled):
+        """Toggle interactive calibration mode"""
+        self.calibration_mode = enabled
+        if enabled:
+            self.setCursor(Qt.CrossCursor)
+            # Show toast instruction on overlay
+            self.addShape("RECT", 20, 20, 300, 40, "black", "Click anywhere to verify coordinates")
+        else:
+            self.setCursor(Qt.ArrowCursor)
+            self.clearLayout()
+    
     def mousePressEvent(self, event):
-        """Handle mouse press - distinguish between click and drag"""
+        """Handle mouse press for dragging and expanding"""
+        # Calibration mode click (only when explicitly enabled)
+        if self.calibration_mode:
+            pos = event.pos()
+            x, y = pos.x(), pos.y()
+            self.clearLayout()
+            self.addShape("RECT", x - 50, y, 100, 2, "cyan", f"Actual: {x}, {y}")
+            self.addShape("RECT", x, y - 50, 2, 100, "cyan")
+            self.addShape("CIRCLE", x - 10, y - 10, 20, 20, "red")
+            print(f"Calibration Click: ({x}, {y})")
+            QTimer.singleShot(2000, lambda: self.setCalibrationMode(False))
+            event.accept()
+            return
+
+        # Standard window interaction
         if event.button() == Qt.LeftButton:
             self.mouse_press_pos = event.globalPos()
             self.dragPosition = event.globalPos() - self.frameGeometry().topLeft()
             self.is_dragging = False
             event.accept()
+    
+    def keyPressEvent(self, event):
+        """Handle keyboard input for overlay control"""
+        if event.key() in (Qt.Key_Space, Qt.Key_Right):
+            if hasattr(self, 'overlay') and self.overlay.isVisible():
+                self.overlay.nextStep()
+                event.accept()
+                return
+        
+        if event.key() == Qt.Key_Escape:
+            if hasattr(self, 'overlay') and self.overlay.isVisible():
+                self.overlay.closeOverlay()
+                event.accept()
+                return
+                
+        super().keyPressEvent(event)
     
     def mouseMoveEvent(self, event):
         """Handle mouse move - detect drag vs click"""
@@ -1139,9 +2018,8 @@ class CircularWindow(QWidget):
                 # If moved more than 5 pixels, it's a drag
                 if delta > 5:
                     self.is_dragging = True
-                    # Only allow dragging when minimized (bubble state)
-                    if not self.is_expanded:
-                        self.move(event.globalPos() - self.dragPosition)
+                    # Allow dragging in both bubble and expanded states
+                    self.move(event.globalPos() - self.dragPosition)
             event.accept()
     
     def mouseReleaseEvent(self, event):
