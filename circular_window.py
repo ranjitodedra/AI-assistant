@@ -5,7 +5,7 @@ import io
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QTextEdit, QLineEdit, QPushButton, QLabel, QScrollArea, QDialog, QSizeGrip)
-from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QRect, QSize
+from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QRect, QSize, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty
 from PyQt5.QtGui import (QPainter, QBrush, QColor, QFont, QLinearGradient, 
                         QPen, QPainterPath, QFontMetrics, QGradient)
 from PyQt5.QtWidgets import QGraphicsDropShadowEffect, QGraphicsBlurEffect
@@ -311,12 +311,25 @@ class CircularWindow(QWidget):
         # API key stored in memory (session only)
         self.api_key = None
         
+        # Robot face animation state
+        self._pulse_value = 0.0  # For glow pulse animation
+        self._is_hovered = False
+        
+        # Pulse animation timer for subtle glow
+        self.pulse_timer = QTimer(self)
+        self.pulse_timer.timeout.connect(self._updatePulse)
+        self.pulse_timer.start(50)  # 20 FPS for smooth animation
+        
         # Dark Mode Glassmorphism colors - Enhanced for minimalist floating look
         self.charcoal_color = QColor(20, 20, 20, 180)  # Extended alpha for transparency
         self.onyx_color = QColor(10, 10, 10, 180)      # Extended alpha for transparency
         self.dark_glass = QColor(0, 0, 0, 100)    # Increased opacity for better contrast with transparent bg
         self.border_white = QColor(255, 255, 255, 30) # Thinner border
         self.rim_light = QColor(255, 255, 255, 15)  # Even more subtle rim lighting
+        
+        # Robot face colors
+        self.robot_primary = QColor(100, 180, 255)  # Soft blue for eyes
+        self.robot_glow = QColor(120, 200, 255, 80)  # Glow effect
         
         self.initUI()
         
@@ -326,7 +339,7 @@ class CircularWindow(QWidget):
     
     def initUI(self):
         # Set initial window size (bubble state)
-        self.setFixedSize(50, 50)
+        self.setFixedSize(40, 40)
         
         # Make window frameless
         self.setWindowFlags(
@@ -499,9 +512,9 @@ class CircularWindow(QWidget):
         
         layout.addStretch()
         
-        # Minimalist Close button
+        # Minimalist Close button - smaller size
         close_button = IconButton("close", title_bar)
-        close_button.setFixedSize(24, 24)
+        close_button.setFixedSize(20, 20)
         close_button.setStyleSheet("""
             QPushButton {
                 background: rgba(255, 255, 255, 0.05);
@@ -597,7 +610,7 @@ class CircularWindow(QWidget):
         )
         
         # Resize back to bubble
-        self.setFixedSize(50, 50)
+        self.setFixedSize(40, 40)
         
         # Restore bubble position or use current position
         if self.bubble_position:
@@ -935,47 +948,144 @@ class CircularWindow(QWidget):
             # Draw glassmorphism chat window
             self.paintChatWindow(painter)
     
+    def _updatePulse(self):
+        """Update pulse animation value for subtle glow effect"""
+        import math
+        self._pulse_value += 0.03
+        if self._pulse_value >= 1.0:
+            self._pulse_value = 0.0
+        if not self.is_expanded:
+            self.update()
+    
+    def enterEvent(self, event):
+        """Handle mouse enter for hover effect"""
+        self._is_hovered = True
+        self.update()
+        super().enterEvent(event)
+    
+    def leaveEvent(self, event):
+        """Handle mouse leave"""
+        self._is_hovered = False
+        self.update()
+        super().leaveEvent(event)
+    
     def paintBubble(self, painter):
-        """Paint dark glass circular bubble"""
-        size = 50
-        radius = size // 2
+        """Paint cute robot mascot with white body, dark visor, and bar eyes"""
+        import math
+        size = 32  # Smaller, compact icon
+        center_x, center_y = size // 2, size // 2
         
-        # Draw dark gradient background circle
-        gradient = QLinearGradient(0, 0, size, size)
-        gradient.setColorAt(0, self.charcoal_color)
-        gradient.setColorAt(1, self.onyx_color)
+        # Calculate pulse effect
+        pulse = (math.sin(self._pulse_value * 2 * math.pi) + 1) / 2
         
-        # Outer glow - very subtle for dark mode
-        glow_pen = QPen(QColor(255, 255, 255, 20))
-        glow_pen.setWidth(2)
-        painter.setPen(glow_pen)
-        painter.setBrush(QBrush(gradient))
-        painter.drawEllipse(2, 2, size - 4, size - 4)
+        # === WHITE BODY (outer shell - more circular) ===
+        body_gradient = QLinearGradient(0, 0, 0, size)
+        body_gradient.setColorAt(0, QColor(255, 255, 255, 255))
+        body_gradient.setColorAt(1, QColor(230, 235, 240, 255))
         
-        # Dark glass circle
-        glass_gradient = QLinearGradient(0, 0, size, size)
-        glass_gradient.setColorAt(0, QColor(255, 255, 255, 20))
-        glass_gradient.setColorAt(1, QColor(0, 0, 0, 40))
+        painter.setPen(QPen(QColor(200, 205, 215, 180), 1))
+        painter.setBrush(QBrush(body_gradient))
         
-        painter.setPen(QPen(self.border_white, 1))
-        painter.setBrush(QBrush(glass_gradient))
-        painter.drawEllipse(3, 3, size - 6, size - 6)
+        # Draw rounded body (more circular with larger radius)
+        body_path = QPainterPath()
+        body_path.addRoundedRect(2, 4, size - 4, size - 6, 12, 12)
+        painter.drawPath(body_path)
         
-        # Draw minimalist AI icon (sparkle)
-        icon_pen = QPen(QColor(255, 255, 255, 220), 1.5)
-        painter.setPen(icon_pen)
+        # === SMALL EARS ===
+        ear_color = QColor(240, 245, 250, 255)
+        painter.setPen(QPen(QColor(200, 205, 215, 150), 1))
+        painter.setBrush(QBrush(ear_color))
+        
+        # Left ear
+        left_ear = QPainterPath()
+        left_ear.moveTo(6, 10)
+        left_ear.lineTo(2, 4)
+        left_ear.lineTo(10, 8)
+        left_ear.closeSubpath()
+        painter.drawPath(left_ear)
+        
+        # Right ear
+        right_ear = QPainterPath()
+        right_ear.moveTo(size - 6, 10)
+        right_ear.lineTo(size - 2, 4)
+        right_ear.lineTo(size - 10, 8)
+        right_ear.closeSubpath()
+        painter.drawPath(right_ear)
+        
+        # === TOP ANTENNA/LIGHT BAR (cyan glow) ===
+        antenna_alpha = 180 + int(pulse * 75)
+        antenna_color = QColor(80, 200, 255, antenna_alpha)
+        antenna_pen = QPen(antenna_color, 2)
+        antenna_pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(antenna_pen)
         painter.setBrush(Qt.NoBrush)
         
-        center_x, center_y = size // 2, size // 2
-        icon_size = 18
+        antenna_path = QPainterPath()
+        antenna_path.moveTo(center_x - 8, 5)
+        antenna_path.quadTo(center_x, 2, center_x + 8, 5)
+        painter.drawPath(antenna_path)
         
-        path = QPainterPath()
-        path.moveTo(center_x, center_y - icon_size // 2)
-        path.lineTo(center_x, center_y + icon_size // 2)
-        path.moveTo(center_x - icon_size // 2, center_y)
-        path.lineTo(center_x + icon_size // 2, center_y)
+        # === DARK VISOR ===
+        visor_gradient = QLinearGradient(5, 10, size - 5, size - 12)
+        visor_gradient.setColorAt(0, QColor(50, 55, 70, 255))
+        visor_gradient.setColorAt(0.3, QColor(40, 45, 60, 255))
+        visor_gradient.setColorAt(0.6, QColor(55, 60, 75, 255))
+        visor_gradient.setColorAt(1, QColor(45, 50, 65, 255))
         
-        painter.drawPath(path)
+        painter.setPen(QPen(QColor(70, 80, 100, 200), 1))
+        painter.setBrush(QBrush(visor_gradient))
+        
+        visor_path = QPainterPath()
+        visor_path.addRoundedRect(6, 10, size - 12, size - 18, 6, 6)
+        painter.drawPath(visor_path)
+        
+        # Diagonal shine lines on visor
+        shine_pen = QPen(QColor(80, 90, 110, 60), 1)
+        painter.setPen(shine_pen)
+        painter.drawLine(10, 12, 18, 22)
+        painter.drawLine(14, 11, 24, 23)
+        painter.drawLine(20, 11, 30, 21)
+        
+        # === HORIZONTAL BAR EYES ===
+        eye_y = center_y - 1
+        eye_width = 6
+        eye_height = 2
+        eye_spacing = 10
+        
+        eye_alpha = 200 + int(pulse * 55)
+        eye_color = QColor(80, 220, 255, eye_alpha)
+        eye_glow = QColor(80, 220, 255, 80 + int(pulse * 50))
+        
+        left_eye_x = center_x - eye_spacing // 2 - eye_width // 2
+        right_eye_x = center_x + eye_spacing // 2 - eye_width // 2
+        
+        # Eye glow
+        glow_pen = QPen(eye_glow, 2)
+        glow_pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(glow_pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(left_eye_x - 1, eye_y - 1, eye_width + 2, eye_height + 2, 2, 2)
+        painter.drawRoundedRect(right_eye_x - 1, eye_y - 1, eye_width + 2, eye_height + 2, 2, 2)
+        
+        # Eye fill
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(eye_color))
+        painter.drawRoundedRect(left_eye_x, eye_y, eye_width, eye_height, 1, 1)
+        painter.drawRoundedRect(right_eye_x, eye_y, eye_width, eye_height, 1, 1)
+        
+        # === SMALL SAD/NEUTRAL MOUTH ===
+        mouth_y = center_y + 6
+        mouth_alpha = 180 + int(pulse * 75)
+        mouth_color = QColor(80, 220, 255, mouth_alpha)
+        mouth_pen = QPen(mouth_color, 1.5)
+        mouth_pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(mouth_pen)
+        painter.setBrush(Qt.NoBrush)
+        
+        mouth_path = QPainterPath()
+        mouth_path.moveTo(center_x - 4, mouth_y)
+        mouth_path.quadTo(center_x, mouth_y + 2, center_x + 4, mouth_y)
+        painter.drawPath(mouth_path)
     
     def paintChatWindow(self, painter):
         """Paint minimalist dark mode glassmorphism chat window"""
