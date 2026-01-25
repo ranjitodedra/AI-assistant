@@ -1,0 +1,30 @@
+{
+  "test_speaker": {
+    "description": "Guide user to test laptop speakers",
+    "keywords": ["test", "speaker", "speakers", "audio", "sound test"],
+    "steps": [
+      {"id": "open_settings", "type": "open_app", "target": "Settings", "description": "Open Windows Settings"},
+      {"id": "goto_system", "type": "navigate", "target": "System", "description": "Click on System"},
+      {"id": "goto_sound", "type": "navigate", "target": "Sound", "description": "Click on Sound"},
+      {"id": "press_test", "type": "action", "target": "Test", "description": "Click Test to play test sound"}
+    ]
+  },
+  "check_wifi_status": {
+    "description": "Guide user to check WiFi connection status",
+    "keywords": ["wifi", "wi-fi", "wireless", "internet", "connection", "network status"],
+    "steps": [
+      {"id": "open_settings", "type": "open_app", "target": "Settings", "description": "Open Windows Settings"},
+      {"id": "goto_network", "type": "navigate", "target": "Network", "description": "Click on Network & Internet"},
+      {"id": "check_wifi", "type": "navigate", "target": "Wi-Fi", "description": "Click on Wi-Fi to see status"}
+    ]
+  },
+  "change_wallpaper": {
+    "description": "Guide user to change desktop wallpaper",
+    "keywords": ["wallpaper", "background", "desktop", "theme"],
+    "steps": [
+      {"id": "open_settings", "type": "open_app", "target": "Settings", "description": "Open Windows Settings"},
+      {"id": "goto_personalization", "type": "navigate", "target": "Personalization", "description": "Click on Personalization"},
+      {"id": "goto_background", "type": "navigate", "target": "Background", "description": "Click on Background"}
+    ]
+  }
+}

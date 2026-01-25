@@ -15,6 +15,203 @@ import pytesseract
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 from PIL import ImageGrab, Image
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, RetryCallState
+import json
+import logging
+
+# Configure logging for guided tasks
+logging.basicConfig(
+    filename='guided_task.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+guided_logger = logging.getLogger('guided_task')
+
+
+class TaskGraphLoader:
+    """Load and manage task graphs from JSON file"""
+    
+    def __init__(self, graph_path="task_graph.json"):
+        self.graph_path = graph_path
+        self.tasks = {}
+        self.load()
+    
+    def load(self):
+        """Load task graph from JSON file"""
+        try:
+            if os.path.exists(self.graph_path):
+                with open(self.graph_path, 'r', encoding='utf-8') as f:
+                    self.tasks = json.load(f)
+                guided_logger.info(f"Loaded {len(self.tasks)} tasks from {self.graph_path}")
+            else:
+                guided_logger.warning(f"Task graph file not found: {self.graph_path}")
+                self.tasks = {}
+        except Exception as e:
+            guided_logger.error(f"Failed to load task graph: {e}")
+            self.tasks = {}
+    
+    def get_task(self, task_id):
+        """Get a task by ID"""
+        return self.tasks.get(task_id)
+    
+    def get_all_task_ids(self):
+        """Get all available task IDs"""
+        return list(self.tasks.keys())
+    
+    def get_task_steps(self, task_id):
+        """Get steps for a task"""
+        task = self.get_task(task_id)
+        if task:
+            return task.get("steps", [])
+        return []
+
+
+class IntentParser:
+    """Parse user intent and map to task IDs"""
+    
+    def __init__(self, task_loader):
+        self.task_loader = task_loader
+    
+    def parse(self, user_message):
+        """
+        Parse user message and return matching task_id or None.
+        Returns: (task_id, confidence) or (None, 0)
+        """
+        message_lower = user_message.lower()
+        
+        best_match = None
+        best_score = 0
+        
+        for task_id, task_data in self.task_loader.tasks.items():
+            keywords = task_data.get("keywords", [])
+            score = 0
+            
+            # Count keyword matches
+            for keyword in keywords:
+                if keyword.lower() in message_lower:
+                    # Longer keywords are weighted more
+                    score += len(keyword.split())
+            
+            # Also check task description
+            description = task_data.get("description", "").lower()
+            desc_words = description.split()
+            for word in desc_words:
+                if len(word) > 3 and word in message_lower:
+                    score += 0.5
+            
+            if score > best_score:
+                best_score = score
+                best_match = task_id
+        
+        # Require minimum score
+        if best_score >= 1:
+            confidence = min(1.0, best_score / 3.0)
+            guided_logger.info(f"Intent parsed: '{user_message}' -> {best_match} (score={best_score}, conf={confidence:.2f})")
+            return (best_match, confidence)
+        
+        guided_logger.info(f"No intent match for: '{user_message}'")
+        return (None, 0)
+    
+    def get_suggestions(self):
+        """Get list of available task descriptions for user"""
+        suggestions = []
+        for task_id, task_data in self.task_loader.tasks.items():
+            desc = task_data.get("description", task_id)
+            suggestions.append(f"• {desc}")
+        return suggestions
+
+
+class GuidedTaskController:
+    """Manages step-by-step guided task execution"""
+    
+    def __init__(self, parent_window):
+        self.parent = parent_window
+        self.task_loader = TaskGraphLoader()
+        self.intent_parser = IntentParser(self.task_loader)
+        
+        # Current task state
+        self.current_task_id = None
+        self.current_task = None
+        self.current_step_index = 0
+        self.waiting_for_confirm = False
+        self.last_matched_candidate = None
+        
+        # Debug mode
+        self.debug_guided_overlay = False
+    
+    def is_active(self):
+        """Check if a guided task is currently active"""
+        return self.current_task_id is not None
+    
+    def start_task(self, task_id):
+        """Start a guided task"""
+        task = self.task_loader.get_task(task_id)
+        if not task:
+            guided_logger.error(f"Task not found: {task_id}")
+            return False
+        
+        self.current_task_id = task_id
+        self.current_task = task
+        self.current_step_index = 0
+        self.waiting_for_confirm = False
+        self.last_matched_candidate = None
+        
+        guided_logger.info(f"Started task: {task_id} with {len(task.get('steps', []))} steps")
+        return True
+    
+    def get_current_step(self):
+        """Get the current step data"""
+        if not self.current_task:
+            return None
+        steps = self.current_task.get("steps", [])
+        if self.current_step_index < len(steps):
+            return steps[self.current_step_index]
+        return None
+    
+    def get_progress(self):
+        """Get progress string"""
+        if not self.current_task:
+            return ""
+        steps = self.current_task.get("steps", [])
+        return f"Step {self.current_step_index + 1} of {len(steps)}"
+    
+    def advance_step(self):
+        """Advance to the next step"""
+        if not self.current_task:
+            return False
+        
+        steps = self.current_task.get("steps", [])
+        self.current_step_index += 1
+        self.waiting_for_confirm = False
+        self.last_matched_candidate = None
+        
+        if self.current_step_index >= len(steps):
+            guided_logger.info(f"Task completed: {self.current_task_id}")
+            return False  # Task complete
+        
+        guided_logger.info(f"Advanced to step {self.current_step_index + 1}")
+        return True
+    
+    def cancel_task(self):
+        """Cancel the current task"""
+        if self.current_task_id:
+            guided_logger.info(f"Task cancelled: {self.current_task_id}")
+        
+        self.current_task_id = None
+        self.current_task = None
+        self.current_step_index = 0
+        self.waiting_for_confirm = False
+        self.last_matched_candidate = None
+    
+    def set_waiting_for_confirm(self, candidate):
+        """Set state to waiting for user confirmation"""
+        self.waiting_for_confirm = True
+        self.last_matched_candidate = candidate
+    
+    def confirm_and_advance(self):
+        """User confirmed - advance to next step"""
+        if not self.waiting_for_confirm:
+            return False
+        return self.advance_step()
 
 
 class GlassmorphismTitleBar(QWidget):
@@ -995,6 +1192,19 @@ class CircularWindow(QWidget):
         # Follow-Along Manager
         self.follow_manager = FollowAlongManager(self)
         
+        # Guided Task Controller
+        self.guided_controller = GuidedTaskController(self)
+        
+        # Conversational Guidance State (6-step pipeline)
+        self.conv_goal = None  # Current user goal (e.g., "test speaker")
+        self.conv_context = []  # History of steps taken
+        self.conv_last_instruction = None  # Last instruction given
+        # New 6-step pipeline state
+        self.conv_initial_step = None  # Step 1 result: logical next step (no screen)
+        self.conv_current_page = None  # Step 2 result: current page identity
+        self.conv_target_word = None   # Step 3 result: exact word to locate
+        self.conv_screenshot = None    # Screenshot captured for steps 2-4
+        
         # Hotkey Manager
         self.hotkey_manager = GlobalHotkeyManager(self)
         self.hotkey_manager.sig_toggle_overlay.connect(self.toggleOverlayVisibility)
@@ -1398,6 +1608,45 @@ class CircularWindow(QWidget):
                     self._drawOverlayFromCandidate(match, padding, source_image)
                     self.input_field.clear()
                     return
+        
+        # Handle guided task commands (confirm/skip/cancel/retry/ocr_id)
+        if self.guided_controller.is_active():
+            if self._handleGuidedCommand(message):
+                self.input_field.clear()
+                return
+        
+        # Check for help command
+        message_lower = message.lower().strip()
+        if message_lower in ("help", "tasks", "what can you do", "show tasks"):
+            self.input_field.clear()
+            self._showAvailableTasks()
+            return
+        
+        # CONVERSATIONAL GUIDANCE: Check if we're in an active conversation
+        if self.conv_goal:
+            # Continue the conversation
+            self.input_field.clear()
+            if self._continueConversationalGuidance(message):
+                return
+        
+        # CONVERSATIONAL GUIDANCE: Check for new goal statement
+        # Works even without screen monitoring - will capture on demand
+        if self._isGoalStatement(message):
+            print(f"[DEBUG] Goal statement detected: '{message}'")
+            goal = self._extractGoalFromMessage(message)
+            print(f"[DEBUG] Extracted goal: '{goal}'")
+            if goal:
+                self.input_field.clear()
+                self._startConversationalGuidance(goal, message)
+                return
+        
+        # Check for manual task start (e.g., "start test_speaker") - legacy
+        if message_lower.startswith("start "):
+            task_id = message_lower[6:].strip().replace(" ", "_")
+            if self.guided_controller.task_loader.get_task(task_id):
+                self.input_field.clear()
+                self._startGuidedTask(task_id, message)
+                return
         
         # Disable input while processing
         self.input_field.setEnabled(False)
@@ -2368,6 +2617,905 @@ x=pixels from left, y=pixels from top (use screenshot size for coordinates)."""
         print(f"[DEBUG] Drawing rect at ({left}, {top}) size ({width}x{height})")
         shape = OverlayShape("RECT", left, top, width, height, "red", "target", step=1)
         self._renderOverlayShapes([shape], source_image)
+
+    # ==================== GUIDED TASK METHODS ====================
+    
+    def _showAvailableTasks(self):
+        """Show list of available guided tasks"""
+        tasks = self.guided_controller.task_loader.tasks
+        
+        if not tasks:
+            msg = """
+            <div style="background: rgba(255, 200, 100, 0.2); 
+                        border: 1px solid rgba(255, 200, 100, 0.4); 
+                        border-radius: 12px; 
+                        padding: 10px 14px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 255, 200, 0.95);">
+                No guided tasks available. Add tasks to task_graph.json.
+            </div>
+            """
+            self.message_area.append(msg)
+            self.scrollToBottom()
+            return
+        
+        task_list = ""
+        for task_id, task_data in tasks.items():
+            desc = task_data.get("description", task_id)
+            keywords = ", ".join(task_data.get("keywords", [])[:3])
+            task_list += f"""
+            <div style="margin: 4px 0; padding: 6px 10px; 
+                        background: rgba(255, 255, 255, 0.05); 
+                        border-radius: 8px;">
+                <b>{desc}</b><br>
+                <small style="color: rgba(255,255,255,0.6);">Keywords: {keywords}</small><br>
+                <small style="color: rgba(80, 200, 255, 0.8);">Say: "start {task_id}" or use keywords</small>
+            </div>
+            """
+        
+        msg = f"""
+        <div style="background: rgba(80, 200, 255, 0.15); 
+                    border: 1px solid rgba(80, 200, 255, 0.3); 
+                    border-radius: 12px; 
+                    padding: 12px 14px; 
+                    margin: 8px 0; 
+                    color: rgba(255, 255, 255, 0.95);">
+            <b>📋 Available Guided Tasks:</b>
+            {task_list}
+        </div>
+        """
+        self.message_area.append(msg)
+        self.scrollToBottom()
+    
+    def _startGuidedTask(self, task_id, user_message):
+        """Start a new guided task"""
+        task = self.guided_controller.task_loader.get_task(task_id)
+        if not task:
+            error_msg = f"""
+            <div style="background: rgba(255, 100, 100, 0.2); 
+                        border: 1px solid rgba(255, 150, 150, 0.4); 
+                        border-radius: 12px; 
+                        padding: 10px 14px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 200, 200, 0.95);">
+                ❌ Task not found: {task_id}
+            </div>
+            """
+            self.message_area.append(error_msg)
+            self.scrollToBottom()
+            return
+        
+        # Show task start message
+        description = task.get("description", task_id)
+        steps = task.get("steps", [])
+        
+        # Add user message display
+        user_msg_html = f"""
+        <div style="margin: 8px 0; text-align: right;">
+            <span style="background: rgba(0, 100, 255, 0.4); 
+                        border: 1px solid rgba(255, 255, 255, 0.1); 
+                        border-radius: 18px; 
+                        padding: 8px 16px; 
+                        color: white;
+                        display: inline-block;">
+                {user_message}
+            </span>
+        </div>
+        """
+        self.message_area.append(user_msg_html)
+        
+        start_msg = f"""
+        <div style="background: rgba(80, 200, 255, 0.2); 
+                    border: 1px solid rgba(80, 200, 255, 0.4); 
+                    border-radius: 16px; 
+                    padding: 12px 16px; 
+                    margin: 8px 0; 
+                    color: rgba(255, 255, 255, 0.95);">
+            🚀 <b>Starting: {description}</b><br>
+            <small style="color: rgba(255,255,255,0.7);">{len(steps)} steps • Reply <b>cancel</b> anytime to stop</small>
+        </div>
+        """
+        self.message_area.append(start_msg)
+        self.scrollToBottom()
+        
+        guided_logger.info(f"Starting guided task: {task_id}")
+        
+        # Start the task
+        self.guided_controller.start_task(task_id)
+        
+        # Execute first step after a short delay
+        QTimer.singleShot(800, self._executeGuidedStep)
+    
+    def _executeGuidedStep(self):
+        """Execute the current step of a guided task"""
+        if not self.guided_controller.is_active():
+            return
+        
+        step = self.guided_controller.get_current_step()
+        if not step:
+            self._completeGuidedTask()
+            return
+        
+        target = step.get("target", "")
+        step_desc = step.get("description", target)
+        progress = self.guided_controller.get_progress()
+        
+        guided_logger.info(f"Executing step: {step} (target={target})")
+        
+        # Show step info in chat
+        step_msg = f"""
+        <div style="background: rgba(80, 200, 255, 0.15); 
+                    border: 1px solid rgba(80, 200, 255, 0.3); 
+                    border-radius: 12px; 
+                    padding: 10px 14px; 
+                    margin: 8px 0; 
+                    color: rgba(255, 255, 255, 0.95);">
+            <b>📍 {progress}</b><br>
+            {step_desc}
+        </div>
+        """
+        self.message_area.append(step_msg)
+        self.scrollToBottom()
+        
+        # Capture fresh screenshot
+        image = self._captureOverlayScreenshot()
+        if not image:
+            self._guidedStepError("Could not capture screenshot")
+            return
+        
+        # Extract OCR candidates
+        candidates = self._extractOcrCandidates(image)
+        
+        # Log candidates for debugging
+        guided_logger.debug(f"OCR found {len(candidates)} candidates")
+        if self.guided_controller.debug_guided_overlay:
+            guided_logger.debug(f"Candidates: {json.dumps(candidates[:20], indent=2)}")
+        
+        # Try local OCR matching for the target
+        matched = self._guidedOcrMatch(target, candidates)
+        
+        if matched:
+            # Found match - select smallest bounding box
+            best = min(matched, key=lambda c: c["width"] * c["height"])
+            guided_logger.info(f"Matched target '{target}' to OCR: {best}")
+            
+            # Draw debug overlay if enabled
+            if self.guided_controller.debug_guided_overlay:
+                self._renderDebugGuidedCandidates(candidates, best, image)
+            else:
+                # Draw only the selected overlay
+                self._drawOverlayFromCandidate(best, padding=6, source_image=image)
+            
+            # Set waiting for confirmation
+            self.guided_controller.set_waiting_for_confirm(best)
+            self._showGuidedConfirmUI(target, best)
+        else:
+            # No local match - try LLM selection
+            guided_logger.info(f"No local match for '{target}', trying LLM selection")
+            self._requestGuidedLLMSelection(target, candidates, image)
+    
+    def _guidedOcrMatch(self, target, candidates):
+        """Match target string against OCR candidates for guided tasks"""
+        import re
+        
+        if not candidates or not target:
+            return []
+        
+        target_lower = target.lower().strip()
+        target_tokens = set(re.split(r'[\s\W]+', target_lower))
+        target_tokens = {t for t in target_tokens if len(t) >= 2}
+        
+        exact_matches = []
+        fuzzy_matches = []
+        
+        for c in candidates:
+            text_lower = c["text"].lower().strip()
+            
+            # Exact full match
+            if target_lower == text_lower:
+                exact_matches.append(c)
+                continue
+            
+            # Target contained in text or vice versa
+            if target_lower in text_lower or text_lower in target_lower:
+                exact_matches.append(c)
+                continue
+            
+            # Token match
+            text_tokens = set(re.split(r'[\s\W]+', text_lower))
+            if target_tokens & text_tokens:
+                exact_matches.append(c)
+                continue
+            
+            # Fuzzy match for longer targets
+            if len(target_lower) >= 4 and c["confidence"] >= 0.6:
+                if self._levenshtein(target_lower, text_lower) <= 2:
+                    fuzzy_matches.append(c)
+        
+        if exact_matches:
+            return exact_matches
+        return fuzzy_matches
+    
+    def _requestGuidedLLMSelection(self, target, candidates, image):
+        """Ask LLM to select from candidates when local matching fails"""
+        if not candidates:
+            self._showGuidedNoCandidates(target)
+            return
+        
+        # Build strict JSON prompt
+        candidates_json = json.dumps(candidates[:50], indent=2)  # Limit to 50 candidates
+        
+        prompt = f"""You must select ONE candidate from the list below that best matches the target UI element.
+Return JSON only. Do NOT invent coordinates.
+
+Target: "{target}"
+
+Candidates:
+{candidates_json}
+
+Response schema (JSON only, no markdown):
+{{"selection": {{"ocr_id": 123, "padding": 6, "confidence": 0.93}}, "reason": "brief explanation"}}
+
+Rules:
+- selection must be null if no candidate matches or confidence < 0.6
+- Use exact ocr_id from candidates list
+- Output ONLY raw JSON"""
+        
+        guided_logger.debug(f"LLM selection prompt for target: {target}")
+        
+        # Store context for response handler
+        self._guided_llm_context = {
+            "target": target,
+            "candidates": candidates,
+            "image": image
+        }
+        
+        self.gemini_worker = GeminiWorker("Select candidate", self.api_key, image_data=image, system_prompt=prompt)
+        self.gemini_worker.response_received.connect(self._onGuidedLLMResponse)
+        self.gemini_worker.error_occurred.connect(self._onGuidedLLMError)
+        self.gemini_worker.finished.connect(self.onWorkerFinished)
+        self.gemini_worker.start()
+    
+    def _onGuidedLLMResponse(self, response_text):
+        """Handle LLM selection response for guided task"""
+        import re
+        
+        context = getattr(self, '_guided_llm_context', {})
+        target = context.get("target", "")
+        candidates = context.get("candidates", [])
+        image = context.get("image")
+        
+        guided_logger.debug(f"LLM response: {response_text[:500]}")
+        
+        # Extract JSON
+        clean_response = response_text.strip()
+        if "```" in clean_response:
+            match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', clean_response)
+            if match:
+                clean_response = match.group(1).strip()
+        
+        try:
+            data = json.loads(clean_response)
+            selection = data.get("selection")
+            
+            if selection and selection.get("ocr_id"):
+                ocr_id = selection.get("ocr_id")
+                padding = selection.get("padding", 6)
+                confidence = selection.get("confidence", 0)
+                
+                if confidence < 0.6:
+                    selection = None
+                else:
+                    # Find the candidate
+                    matched = next((c for c in candidates if c.get("ocr_id") == ocr_id), None)
+                    if matched:
+                        guided_logger.info(f"LLM selected: {matched}")
+                        
+                        if self.guided_controller.debug_guided_overlay:
+                            self._renderDebugGuidedCandidates(candidates, matched, image)
+                        else:
+                            self._drawOverlayFromCandidate(matched, padding, image)
+                        
+                        self.guided_controller.set_waiting_for_confirm(matched)
+                        self._showGuidedConfirmUI(target, matched)
+                        return
+            
+            # Selection is null or invalid
+            self._showGuidedNoCandidates(target, candidates[:5])
+            
+        except Exception as e:
+            guided_logger.error(f"Failed to parse LLM response: {e}")
+            self._showGuidedNoCandidates(target, candidates[:5])
+    
+    def _onGuidedLLMError(self, error_msg):
+        """Handle LLM error during guided task"""
+        guided_logger.error(f"LLM error: {error_msg}")
+        self._guidedStepError(f"AI error: {error_msg}")
+    
+    def _showGuidedConfirmUI(self, target, candidate):
+        """Show confirmation UI for guided step"""
+        confirm_msg = f"""
+        <div style="background: rgba(80, 200, 100, 0.15); 
+                    border: 1px solid rgba(80, 200, 100, 0.3); 
+                    border-radius: 12px; 
+                    padding: 10px 14px; 
+                    margin: 8px 0; 
+                    color: rgba(255, 255, 255, 0.95);">
+            ✅ Found: <b>"{candidate['text']}"</b><br>
+            <small style="color: rgba(255,255,255,0.7);">Reply <b>confirm</b> to proceed, <b>skip</b> to skip this step, or <b>cancel</b> to stop.</small>
+        </div>
+        """
+        self.message_area.append(confirm_msg)
+        self.scrollToBottom()
+    
+    def _showGuidedNoCandidates(self, target, top_candidates=None):
+        """Show message when no candidates found"""
+        msg = f"""
+        <div style="background: rgba(255, 200, 100, 0.2); 
+                    border: 1px solid rgba(255, 200, 100, 0.4); 
+                    border-radius: 12px; 
+                    padding: 10px 14px; 
+                    margin: 8px 0; 
+                    color: rgba(255, 255, 200, 0.95);">
+            ⚠️ Could not find "<b>{target}</b>" on screen.
+        </div>
+        """
+        self.message_area.append(msg)
+        
+        if top_candidates:
+            choices = "".join(
+                f"<div>• <b>{c['ocr_id']}</b>: {c['text']}</div>"
+                for c in top_candidates[:5]
+            )
+            pick_msg = f"""
+            <div style="background: rgba(255, 255, 255, 0.08); 
+                        border: 1px solid rgba(255, 255, 255, 0.15); 
+                        border-radius: 12px; 
+                        padding: 10px 14px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 255, 255, 0.9);">
+                <small>Best candidates (reply with OCR id to select):</small>
+                {choices}
+                <small style="color: rgba(255,255,255,0.6);">Or reply <b>skip</b> to skip, <b>cancel</b> to stop.</small>
+            </div>
+            """
+            self.message_area.append(pick_msg)
+            self.pending_guided_candidates = top_candidates
+        
+        self.scrollToBottom()
+    
+    def _renderDebugGuidedCandidates(self, all_candidates, selected, source_image):
+        """Render all candidates (yellow) and selected (red) for debug"""
+        shapes = []
+        
+        # All candidates in yellow (semi-transparent)
+        for c in all_candidates[:100]:  # Limit for performance
+            label = f"{c['ocr_id']}"
+            shapes.append(OverlayShape("RECT", c["left"], c["top"], c["width"], c["height"], "yellow", label, step=1))
+        
+        # Selected in red (on top)
+        if selected:
+            shapes.append(OverlayShape("RECT", 
+                selected["left"] - 6, selected["top"] - 6, 
+                selected["width"] + 12, selected["height"] + 12, 
+                "red", "TARGET", step=1))
+        
+        self._renderOverlayShapes(shapes, source_image)
+    
+    def _guidedStepError(self, error_msg):
+        """Show error and allow user to retry or cancel"""
+        msg = f"""
+        <div style="background: rgba(255, 100, 100, 0.2); 
+                    border: 1px solid rgba(255, 150, 150, 0.4); 
+                    border-radius: 12px; 
+                    padding: 10px 14px; 
+                    margin: 8px 0; 
+                    color: rgba(255, 200, 200, 0.95);">
+            ❌ Error: {error_msg}<br>
+            <small>Reply <b>retry</b> to try again, <b>skip</b> to skip, or <b>cancel</b> to stop.</small>
+        </div>
+        """
+        self.message_area.append(msg)
+        self.scrollToBottom()
+    
+    def _completeGuidedTask(self):
+        """Handle guided task completion"""
+        task_id = self.guided_controller.current_task_id
+        task = self.guided_controller.current_task
+        desc = task.get("description", task_id) if task else task_id
+        
+        complete_msg = f"""
+        <div style="background: rgba(80, 200, 100, 0.2); 
+                    border: 1px solid rgba(80, 200, 100, 0.4); 
+                    border-radius: 16px; 
+                    padding: 12px 16px; 
+                    margin: 8px 0; 
+                    color: rgba(200, 255, 200, 0.95);">
+            🎉 <b>Task Complete!</b><br>
+            {desc}
+        </div>
+        """
+        self.message_area.append(complete_msg)
+        self.scrollToBottom()
+        
+        guided_logger.info(f"Task completed: {task_id}")
+        self.guided_controller.cancel_task()
+        self.overlay.closeOverlay()
+    
+    def _handleGuidedCommand(self, command):
+        """Handle user commands during guided task (confirm/skip/cancel/retry/ocr_id)"""
+        command_lower = command.lower().strip()
+        
+        if command_lower == "confirm":
+            if self.guided_controller.waiting_for_confirm:
+                self.overlay.closeOverlay()
+                if self.guided_controller.advance_step():
+                    # More steps - execute next
+                    QTimer.singleShot(500, self._executeGuidedStep)
+                else:
+                    # Task complete
+                    self._completeGuidedTask()
+                return True
+        
+        elif command_lower == "skip":
+            self.overlay.closeOverlay()
+            if self.guided_controller.advance_step():
+                QTimer.singleShot(500, self._executeGuidedStep)
+            else:
+                self._completeGuidedTask()
+            return True
+        
+        elif command_lower == "cancel":
+            self.overlay.closeOverlay()
+            self.guided_controller.cancel_task()
+            cancel_msg = """
+            <div style="background: rgba(255, 255, 255, 0.1); 
+                        border-radius: 12px; 
+                        padding: 8px 12px; 
+                        margin: 5px 0; 
+                        color: rgba(255, 255, 255, 0.7);">
+                Task cancelled.
+            </div>
+            """
+            self.message_area.append(cancel_msg)
+            self.scrollToBottom()
+            return True
+        
+        elif command_lower == "retry":
+            self.overlay.closeOverlay()
+            QTimer.singleShot(500, self._executeGuidedStep)
+            return True
+        
+        # Check if it's an OCR id selection
+        if hasattr(self, 'pending_guided_candidates') and self.pending_guided_candidates:
+            try:
+                ocr_id = int(command_lower)
+                matched = next((c for c in self.pending_guided_candidates if c.get("ocr_id") == ocr_id), None)
+                if matched:
+                    image = self._captureOverlayScreenshot()
+                    self._drawOverlayFromCandidate(matched, padding=6, source_image=image)
+                    self.guided_controller.set_waiting_for_confirm(matched)
+                    self._showGuidedConfirmUI(self.guided_controller.get_current_step().get("target", ""), matched)
+                    self.pending_guided_candidates = None
+                    return True
+            except ValueError:
+                pass
+        
+        return False
+
+    # ==================== END GUIDED TASK METHODS ====================
+
+    # ==================== CONVERSATIONAL GUIDANCE ====================
+    
+    def _isGoalStatement(self, message):
+        """Check if message is stating a new goal"""
+        goal_patterns = [
+            "i want to", "i need to", "how do i", "how can i", "help me",
+            "i'm trying to", "i wanna", "can you help me", "show me how to",
+            "guide me to", "take me to", "open", "find", "where is", "where can i"
+        ]
+        msg_lower = message.lower()
+        return any(pattern in msg_lower for pattern in goal_patterns)
+    
+    def _isFollowUp(self, message):
+        """Check if message is asking for next step"""
+        followup_patterns = [
+            "what next", "what's next", "then what", "now what", "next step",
+            "and then", "ok done", "okay done", "done", "next", "continue",
+            "what do i do", "where now", "then?", "now?", "and?", "go on"
+        ]
+        msg_lower = message.lower().strip()
+        return any(pattern in msg_lower for pattern in followup_patterns) or len(msg_lower) <= 10
+    
+    def _startConversationalGuidance(self, goal, message):
+        """Start conversational guidance for a goal using 6-step pipeline"""
+        print(f"[PIPELINE] Starting 6-step guidance for goal: '{goal}'")
+        
+        # Reset all state
+        self.conv_goal = goal
+        self.conv_context = []
+        self.conv_last_instruction = None
+        self.conv_initial_step = None
+        self.conv_current_page = None
+        self.conv_target_word = None
+        self.conv_screenshot = None
+        
+        # Show user message
+        user_msg = f"""
+        <div style="margin: 8px 0; text-align: right;">
+            <span style="background: rgba(0, 100, 255, 0.4); 
+                        border: 1px solid rgba(255, 255, 255, 0.1); 
+                        border-radius: 18px; 
+                        padding: 8px 16px; 
+                        color: white;
+                        display: inline-block;">
+                {message}
+            </span>
+        </div>
+        """
+        self.message_area.append(user_msg)
+        
+        # Show goal acknowledgment
+        ack_msg = f"""
+        <div style="background: rgba(80, 200, 255, 0.15); 
+                    border: 1px solid rgba(80, 200, 255, 0.3); 
+                    border-radius: 12px; 
+                    padding: 10px 14px; 
+                    margin: 8px 0; 
+                    color: rgba(255, 255, 255, 0.95);">
+            🎯 <b>Goal:</b> {goal}<br>
+            <small style="color: rgba(255,255,255,0.7);">I'll guide you step by step. Say "next" after each action, or "cancel" to stop.</small>
+        </div>
+        """
+        self.message_area.append(ack_msg)
+        self.scrollToBottom()
+        
+        # Start 6-step pipeline with Step 1
+        self._convStep1_defineNextStep()
+    
+    def _continueConversationalGuidance(self, message):
+        """Continue guidance - restart 6-step pipeline cycle on 'next'"""
+        if not self.conv_goal:
+            return False
+        
+        msg_lower = message.lower().strip()
+        
+        # Check for cancel
+        if msg_lower in ("cancel", "stop", "quit", "exit", "nevermind"):
+            self._endConversationalGuidance("Guidance cancelled.")
+            return True
+        
+        # Check for done/complete
+        if msg_lower in ("done", "finished", "complete", "that's it", "thanks"):
+            self._endConversationalGuidance("Great! Goal completed! 🎉")
+            return True
+        
+        # Show user message
+        user_msg = f"""
+        <div style="margin: 8px 0; text-align: right;">
+            <span style="background: rgba(0, 100, 255, 0.4); 
+                        border: 1px solid rgba(255, 255, 255, 0.1); 
+                        border-radius: 18px; 
+                        padding: 8px 16px; 
+                        color: white;
+                        display: inline-block;">
+                {message}
+            </span>
+        </div>
+        """
+        self.message_area.append(user_msg)
+        self.scrollToBottom()
+        
+        # Add completed step to context
+        if self.conv_last_instruction:
+            self.conv_context.append(self.conv_last_instruction)
+        
+        # Clear previous overlay
+        self.overlay.closeOverlay()
+        
+        # Reset pipeline state for next cycle
+        self.conv_initial_step = None
+        self.conv_current_page = None
+        self.conv_target_word = None
+        self.conv_screenshot = None
+        
+        # Restart 6-step pipeline from Step 1
+        print(f"[PIPELINE] Restarting cycle. Context: {self.conv_context}")
+        self._convStep1_defineNextStep()
+        return True
+    
+    def _onConvStepError(self, error_msg):
+        """Handle error during conversational guidance"""
+        print(f"[DEBUG] _onConvStepError: {error_msg}")
+        
+        # Remove thinking indicator
+        cursor = self.message_area.textCursor()
+        cursor.movePosition(cursor.End)
+        cursor.select(cursor.BlockUnderCursor)
+        cursor.removeSelectedText()
+        
+        self.message_area.append(f"""
+        <div style="color: rgba(255, 200, 200, 0.9); padding: 8px;">
+            ❌ Error: {error_msg}
+        </div>
+        """)
+        self.scrollToBottom()
+    
+    def _endConversationalGuidance(self, message):
+        """End conversational guidance and reset all state"""
+        self.conv_goal = None
+        self.conv_context = []
+        self.conv_last_instruction = None
+        self.conv_initial_step = None
+        self.conv_current_page = None
+        self.conv_target_word = None
+        self.conv_screenshot = None
+        self.overlay.closeOverlay()
+        
+        end_msg = f"""
+        <div style="background: rgba(80, 200, 100, 0.15); 
+                    border: 1px solid rgba(80, 200, 100, 0.3); 
+                    border-radius: 12px; 
+                    padding: 10px 14px; 
+                    margin: 8px 0; 
+                    color: rgba(200, 255, 200, 0.95);">
+            {message}
+        </div>
+        """
+        self.message_area.append(end_msg)
+        self.scrollToBottom()
+    
+    def _extractGoalFromMessage(self, message):
+        """Extract the goal from a goal statement"""
+        msg_lower = message.lower()
+        
+        # Remove common prefixes
+        prefixes = [
+            "i want to ", "i need to ", "how do i ", "how can i ", "help me ",
+            "i'm trying to ", "i wanna ", "can you help me ", "show me how to ",
+            "guide me to ", "take me to ", "can you ", "please "
+        ]
+        
+        goal = message
+        for prefix in prefixes:
+            if msg_lower.startswith(prefix):
+                goal = message[len(prefix):]
+                break
+        
+        return goal.strip()
+
+    # ==================== 6-STEP PIPELINE METHODS ====================
+    
+    def _convStep1_defineNextStep(self):
+        """Step 1: Define next step WITHOUT looking at screen (pure logic)"""
+        print(f"[STEP 1] Defining next step for goal: '{self.conv_goal}'")
+        
+        # Check API key
+        if not self.api_key or len(str(self.api_key).strip()) < 10:
+            self._convShowError("API key not configured.")
+            self._endConversationalGuidance("Setup required.")
+            return
+        
+        # Build context from previous steps
+        context_str = ""
+        if self.conv_context:
+            context_str = f"\nSteps already completed: {', '.join(self.conv_context[-5:])}"
+        
+        prompt = f"""Goal: {self.conv_goal}{context_str}
+
+What is the logical NEXT step to achieve this goal? 
+Reply with ONLY the action in 2-5 words, like "Open Settings" or "Click System" or "Go to Sound".
+No explanation, just the action."""
+        
+        # Show thinking
+        self.message_area.append("""
+        <div style="color: rgba(255, 255, 255, 0.5); font-style: italic; padding: 4px 8px;">
+            Step 1: Figuring out next step...
+        </div>
+        """)
+        self.scrollToBottom()
+        
+        # Disable input
+        self.input_field.setEnabled(False)
+        self.send_button.setEnabled(False)
+        
+        # AI call WITHOUT image
+        self.gemini_worker = GeminiWorker("define step", self.api_key, image_data=None, system_prompt=prompt)
+        self.gemini_worker.response_received.connect(self._onStep1Response)
+        self.gemini_worker.error_occurred.connect(self._onConvStepError)
+        self.gemini_worker.finished.connect(lambda: None)  # Don't re-enable yet
+        self.gemini_worker.start()
+    
+    def _onStep1Response(self, response_text):
+        """Handle Step 1 response - store initial step and proceed to Step 2"""
+        # Remove thinking indicator
+        self._removeLastMessage()
+        
+        # Clean response
+        self.conv_initial_step = response_text.strip().strip('"').strip("'")
+        print(f"[STEP 1] Initial step defined: '{self.conv_initial_step}'")
+        
+        # Show step 1 result
+        self.message_area.append(f"""
+        <div style="color: rgba(150, 200, 255, 0.8); font-size: 12px; padding: 4px 8px;">
+            Logical next step: {self.conv_initial_step}
+        </div>
+        """)
+        self.scrollToBottom()
+        
+        # Proceed to Step 2
+        self._convStep2_identifyPage()
+    
+    def _convStep2_identifyPage(self):
+        """Step 2: Quick page identification (minimal AI call with screenshot)"""
+        print(f"[STEP 2] Identifying current page...")
+        
+        # Capture screenshot
+        self.conv_screenshot = self._captureOverlayScreenshot()
+        if not self.conv_screenshot:
+            self._convShowError("Could not capture screen.")
+            self.onWorkerFinished()
+            return
+        
+        # Show thinking
+        self.message_area.append("""
+        <div style="color: rgba(255, 255, 255, 0.5); font-style: italic; padding: 4px 8px;">
+            Step 2: Checking what's on screen...
+        </div>
+        """)
+        self.scrollToBottom()
+        
+        prompt = """What app or page is shown in this screenshot? 
+Reply with ONLY 1-3 words identifying it (e.g., "Desktop", "Settings Home", "System Settings", "Sound Settings", "Chrome Browser").
+No explanation, just the page name."""
+        
+        # AI call WITH image
+        self.gemini_worker = GeminiWorker("identify page", self.api_key, image_data=self.conv_screenshot, system_prompt=prompt)
+        self.gemini_worker.response_received.connect(self._onStep2Response)
+        self.gemini_worker.error_occurred.connect(self._onConvStepError)
+        self.gemini_worker.finished.connect(lambda: None)
+        self.gemini_worker.start()
+    
+    def _onStep2Response(self, response_text):
+        """Handle Step 2 response - store page identity and proceed to Step 3"""
+        # Remove thinking indicator
+        self._removeLastMessage()
+        
+        self.conv_current_page = response_text.strip().strip('"').strip("'")
+        print(f"[STEP 2] Current page: '{self.conv_current_page}'")
+        
+        # Show step 2 result
+        self.message_area.append(f"""
+        <div style="color: rgba(150, 200, 255, 0.8); font-size: 12px; padding: 4px 8px;">
+            Current screen: {self.conv_current_page}
+        </div>
+        """)
+        self.scrollToBottom()
+        
+        # Proceed to Step 3
+        self._convStep3_refineAndLocate()
+    
+    def _convStep3_refineAndLocate(self):
+        """Step 3-6: Refine the target word, locate via OCR, draw rectangle"""
+        print(f"[STEP 3] Refining target based on goal='{self.conv_goal}', initial='{self.conv_initial_step}', page='{self.conv_current_page}'")
+        
+        # Show thinking
+        self.message_area.append("""
+        <div style="color: rgba(255, 255, 255, 0.5); font-style: italic; padding: 4px 8px;">
+            Step 3: Determining exact target...
+        </div>
+        """)
+        self.scrollToBottom()
+        
+        # Build context
+        context_str = ""
+        if self.conv_context:
+            context_str = f"\nSteps already completed: {', '.join(self.conv_context[-5:])}"
+        
+        prompt = f"""Goal: {self.conv_goal}
+Initial planned step: {self.conv_initial_step}
+Current screen: {self.conv_current_page}{context_str}
+
+Based on the current screen, what is the EXACT word or button to click next?
+Reply with ONLY the target word/text (e.g., "System", "Sound", "Settings", "Test").
+If goal is already complete on this screen, reply "GOAL_COMPLETE".
+No explanation, just the word to click."""
+        
+        # AI call WITHOUT image (we already know the page)
+        self.gemini_worker = GeminiWorker("refine target", self.api_key, image_data=None, system_prompt=prompt)
+        self.gemini_worker.response_received.connect(self._onStep3Response)
+        self.gemini_worker.error_occurred.connect(self._onConvStepError)
+        self.gemini_worker.finished.connect(lambda: None)
+        self.gemini_worker.start()
+    
+    def _onStep3Response(self, response_text):
+        """Handle Step 3 response - locate target via OCR and draw rectangle (Steps 4-6)"""
+        # Remove thinking indicator
+        self._removeLastMessage()
+        
+        self.conv_target_word = response_text.strip().strip('"').strip("'")
+        print(f"[STEP 3] Target word: '{self.conv_target_word}'")
+        
+        # Check for goal complete
+        if "GOAL_COMPLETE" in self.conv_target_word.upper():
+            self._endConversationalGuidance("Goal appears complete!")
+            self.onWorkerFinished()
+            return
+        
+        # Step 4: Locate target via OCR
+        print(f"[STEP 4] Locating '{self.conv_target_word}' via OCR...")
+        
+        candidates = self._extractOcrCandidates(self.conv_screenshot)
+        if not candidates:
+            self._convShowError("Could not read screen text.")
+            self.onWorkerFinished()
+            return
+        
+        # Find matching candidate
+        matched = self._localOcrMatch(self.conv_target_word, candidates)
+        
+        # Step 5: Stop immediately once found
+        print(f"[STEP 5] Match found: {len(matched) if matched else 0} candidates")
+        
+        if matched:
+            # Pick smallest bounding box
+            best = min(matched, key=lambda c: c["width"] * c["height"])
+            
+            # Step 6: Draw rectangle and show instruction
+            print(f"[STEP 6] Drawing rectangle around '{best.get('text')}'")
+            
+            instruction = f"Click on <b>{self.conv_target_word}</b>"
+            self.conv_last_instruction = f"Click {self.conv_target_word}"
+            
+            # Show instruction
+            self.message_area.append(f"""
+            <div style="background: rgba(255, 255, 255, 0.08); 
+                        border-left: 3px solid rgba(80, 200, 255, 0.6);
+                        padding: 10px 14px; 
+                        margin: 8px 0; 
+                        color: rgba(255, 255, 255, 0.95);">
+                👉 {instruction}
+            </div>
+            """)
+            
+            # Draw overlay
+            self._drawOverlayFromCandidate(best, padding=8, source_image=self.conv_screenshot)
+            
+            # Prompt for next
+            self.message_area.append("""
+            <div style="color: rgba(255, 255, 255, 0.6); font-size: 12px; padding: 4px 8px;">
+                <i>After you click, say "next" to continue.</i>
+            </div>
+            """)
+        else:
+            # Target not found on screen
+            self.message_area.append(f"""
+            <div style="color: rgba(255, 200, 150, 0.9); padding: 8px;">
+                ⚠️ Could not find "{self.conv_target_word}" on screen. 
+                Try navigating closer to it, then say "next".
+            </div>
+            """)
+        
+        self.scrollToBottom()
+        self.onWorkerFinished()
+    
+    def _convShowError(self, msg):
+        """Show error message in chat"""
+        self.message_area.append(f"""
+        <div style="color: rgba(255, 200, 200, 0.9); padding: 8px;">
+            ❌ {msg}
+        </div>
+        """)
+        self.scrollToBottom()
+    
+    def _removeLastMessage(self):
+        """Remove the last message (thinking indicator) from chat"""
+        cursor = self.message_area.textCursor()
+        cursor.movePosition(cursor.End)
+        cursor.select(cursor.BlockUnderCursor)
+        cursor.removeSelectedText()
+
+    # ==================== END CONVERSATIONAL GUIDANCE ====================
 
     def _captureOverlayScreenshot(self):
         """Capture a fresh screenshot for overlay accuracy"""
