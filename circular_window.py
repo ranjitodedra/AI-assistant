@@ -11,8 +11,39 @@ from PyQt5.QtGui import (QPainter, QBrush, QColor, QFont, QLinearGradient,
                         QPen, QPainterPath, QFontMetrics, QGradient)
 from PyQt5.QtWidgets import QGraphicsDropShadowEffect, QGraphicsBlurEffect
 from google import genai
+import shutil
 import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+def find_tesseract():
+    # 1. Check environment variable
+    if os.environ.get('TESSERACT_CMD'):
+        return os.environ['TESSERACT_CMD']
+    
+    # 2. Check system PATH
+    path_from_shutil = shutil.which("tesseract")
+    if path_from_shutil:
+        return path_from_shutil
+        
+    # 3. Check default Windows locations
+    common_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe")
+    ]
+    
+    for path in common_paths:
+        if os.path.exists(path):
+            return path
+            
+    return None
+
+tess_path = find_tesseract()
+if tess_path:
+    pytesseract.pytesseract.tesseract_cmd = tess_path
+else:
+    print("WARNING: Tesseract-OCR not found. OCR features will be disabled.")
+    # We don't crash here, but OCR functions will fail if called
+
 from PIL import ImageGrab, Image
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, RetryCallState
 import json

@@ -151,7 +151,7 @@ The assistant uses an efficient process:
 ### Install Dependencies
 
 ```bash
-pip install PyQt5 google-generativeai pillow pytesseract tenacity keyboard
+pip install -r requirements.txt
 ```
 
 ### Run the App
@@ -251,14 +251,22 @@ AI-assistant/
 
 ## License
 
-This project is for educational and personal use.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
 ## Contributing
 
-Found a bug or have an idea? Feel free to open an issue or submit a pull request!
+Found a bug or have an idea? Please read our [CONTRIBUTING](CONTRIBUTING.md) guide before opening an issue or submitting a pull request.
 
 ---
 
 Made with ❤️ to make computers easier for everyone.
+
+
+## Future Plans
+
+- **Audio Chat**: Voice interaction for hands-free guidance.
+- **Cursor Control**: Allow the AI to perform clicks for you.
+- **MCP Server**: Integrate with Model Context Protocol to use external tools.
+- **Cross-Platform Support**: Mac and Linux support.

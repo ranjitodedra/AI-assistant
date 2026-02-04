@@ -1,0 +1,7 @@
+PyQt5
+google-generativeai
+pillow
+pytesseract
+tenacity
+keyboard
+pyttsx3
